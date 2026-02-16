@@ -1,0 +1,34 @@
+# Single-run sync.
+# From repo root: edit values below, then:
+#   docker compose -f contrib/docker/docker-compose.single-run.yml run --rm pve2netbox
+
+services:
+  pve2netbox:
+    image: aburdey/pve2netbox:1.0.0
+    environment:
+      # PVE API (required — replace with your values)
+      - PVE_API_HOST=10.10.0.10
+      - PVE_API_USER=netsync@pve
+      - PVE_API_TOKEN=test-token
+      - PVE_API_SECRET=your-secret-here
+      # NetBox API (required — replace with your values)
+      - NB_API_URL=https://netbox.example.org
+      - NB_API_TOKEN=your-netbox-token-here
+      # Optional
+      - PVE_API_VERIFY_SSL=false
+      - NB_CLUSTER_ID=1
+      - NB_API_DELAY_SECONDS=0.2
+      - NB_API_RETRY_TOTAL=5
+      - NB_API_RETRY_BACKOFF=1.0
+      - SYNC_VMS=true
+      - SYNC_LXC=true
+      - VM_ROLE=Virtual Machine
+      - LXC_ROLE=LXC
+      # Single-run mode: do not set SYNC_INTERVAL_SECONDS and QUICK_CHECK_INTERVAL_SECONDS
+      - DRY_RUN=false
+      - ENABLE_CLEANUP=false
+      - LOG_LEVEL=INFO
+      - ENABLE_METRICS=false
+      - METRICS_PORT=9090
+    ports:
+      - "9090:9090"

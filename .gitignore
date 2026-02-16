@@ -1,2 +1,15 @@
 dist/
 *.egg-info/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/

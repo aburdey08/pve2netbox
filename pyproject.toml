@@ -5,10 +5,13 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "netbox-pve-sync"
-version = "0.2.4"
+name = "pve2netbox"
+version = "1.0.0"
 authors = [
-    { name = "Aloïs Micard", email = "alois@micard.lu" },
+    { name = "Andrew Burdey", email = "a.burdey08@gmail.com" },
+]
+maintainers = [
+    { name = "Alois Micard", email = "alois@micard.lu" },
 ]
 description = "Synchronize Proxmox Virtual Environment (PVE) information to a NetBox instance"
 readme = "README.md"
@@ -24,12 +27,16 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://git.creekorful.cloud/creekorful/netbox-pve-sync"
-Issues = "https://git.creekorful.cloud/creekorful/netbox-pve-sync/issues"
-Changelog = "https://git.creekorful.cloud/creekorful/netbox-pve-sync/src/branch/main/Changelog.md"
+Homepage = "https://github.com/aburdey08/pve2netbox"
+Issues = "https://github.com/aburdey08/pve2netbox/issues"
+Changelog = "https://github.com/aburdey08/pve2netbox/blob/master/Changelog.md"
+Original = "https://git.creekorful.cloud/creekorful/netbox-pve-sync"
 
 [project.scripts]
-nbpxsync = "netbox_pve_sync:main"
+pve2netbox = "pve2netbox:master"
 
-[license]
-file = 'LICENSE.txt'
+[project.license]
+file = "LICENSE.txt"
+
+[tool.setuptools.packages.find]
+include = ["pve2netbox*"]

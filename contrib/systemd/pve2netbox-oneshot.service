@@ -1,0 +1,17 @@
+[Unit]
+Description=pve2netbox (single run)
+Documentation=https://github.com/aburdey08/pve2netbox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/pve2netbox/env
+ExecStart=/usr/bin/env python3 -m pve2netbox
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pve2netbox
+
+[Install]
+WantedBy=multi-user.target

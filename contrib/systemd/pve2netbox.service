@@ -1,0 +1,20 @@
+[Unit]
+Description=pve2netbox (continuous sync service)
+Documentation=https://github.com/aburdey08/pve2netbox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pve2netbox/env
+ExecStart=/usr/bin/env python3 -m pve2netbox
+Restart=on-failure
+RestartSec=60
+
+# Without limits, logs via journald can grow large
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pve2netbox
+
+[Install]
+WantedBy=multi-user.target

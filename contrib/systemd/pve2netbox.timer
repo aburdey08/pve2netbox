@@ -1,0 +1,12 @@
+[Unit]
+Description=Run pve2netbox periodically (every 5 minutes)
+Documentation=https://github.com/aburdey08/pve2netbox
+
+[Timer]
+Unit=pve2netbox-oneshot.service
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
