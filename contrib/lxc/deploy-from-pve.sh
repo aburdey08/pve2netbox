@@ -20,10 +20,18 @@ DEPLOY_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 command -v pct &>/dev/null || { echo "Command pct not found. Run this script on a Proxmox VE node."; exit 1; }
 
 # Parameters (can be set via environment variables)
+CTID_FROM_ENV="${CTID:-}"
 CTID="${CTID:-200}"
 STORAGE="${STORAGE:-}"           # empty = auto (local-lvm or local)
 BRIDGE="${BRIDGE:-vmbr0}"
-HOSTNAME="${HOSTNAME:-lxc-pve2netbox}"
+PVE_NODE_HOSTNAME="$(hostname 2>/dev/null || true)"
+PVE_NODE_FQDN="$(hostname -f 2>/dev/null || true)"
+HOSTNAME_INPUT="${LXC_HOSTNAME:-${HOSTNAME:-}}"
+if [[ -z "$HOSTNAME_INPUT" ]] || [[ "$HOSTNAME_INPUT" == "$PVE_NODE_HOSTNAME" ]] || [[ -n "$PVE_NODE_FQDN" && "$HOSTNAME_INPUT" == "$PVE_NODE_FQDN" ]]; then
+  HOSTNAME="lxc-pve2netbox"
+else
+  HOSTNAME="$HOSTNAME_INPUT"
+fi
 ROOTFS_SIZE="${ROOTFS_SIZE:-2}"  # GiB
 MEMORY="${MEMORY:-256}"          # MiB
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
@@ -36,8 +44,13 @@ for arg in "$@"; do
     --no-install) NO_INSTALL=1 ;;
     -h|--help)
       echo "Usage: $0 [--no-install]"
-      echo "Variables: CTID, STORAGE, BRIDGE, HOSTNAME, ROOTFS_SIZE, MEMORY, TEMPLATE_STORAGE, REPO_RAW, REPO_GIT"
+      echo "Variables: CTID, STORAGE, BRIDGE, LXC_HOSTNAME (or HOSTNAME), ROOTFS_SIZE, MEMORY, TEMPLATE_STORAGE, REPO_RAW, REPO_GIT"
       exit 0
+      ;;
+    *)
+      echo "Unknown argument: $arg"
+      echo "Usage: $0 [--no-install]"
+      exit 1
       ;;
   esac
 done
@@ -56,10 +69,9 @@ NEXT_FREE=$(next_ctid)
 
 if [[ -t 0 ]]; then
   echo "=== LXC container parameters ==="
-  default_ctid="${CTID:-$NEXT_FREE}"
+  default_ctid="${CTID_FROM_ENV:-$NEXT_FREE}"
   read -p "Container ID (100–999999999) [${default_ctid}]: " input_ctid
   CTID="${input_ctid:-$default_ctid}"
-  CTID=$((CTID))
 
   read -p "Container name (hostname) [${HOSTNAME}]: " input_hostname
   HOSTNAME="${input_hostname:-$HOSTNAME}"
@@ -162,11 +174,14 @@ sleep 15
 # Install pve2netbox inside container
 if [[ -n "$NO_INSTALL" ]]; then
   echo "[*] --no-install mode: app installation skipped."
-  echo "    Manual install: pct exec $CTID -- env REPO_GIT=\"$REPO_GIT\" bash -c 'curl -sL $REPO_RAW/contrib/lxc/install.sh | bash'"
+  echo "    Manual install (ensure curl in container first: apt-get install -y curl):"
+  echo "    pct exec $CTID -- env REPO_GIT=\"$REPO_GIT\" bash -c 'curl -sL $REPO_RAW/contrib/lxc/install.sh | bash'"
   exit 0
 fi
 
 echo "[*] Installing pve2netbox into container $CTID..."
+echo "[*] Ensuring curl (and ca-certificates) in container..."
+pct exec "$CTID" -- bash -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates"
 pct exec "$CTID" -- env REPO_RAW="$REPO_RAW" REPO_GIT="$REPO_GIT" bash -c "curl -sL $REPO_RAW/contrib/lxc/install.sh | bash"
 
 ENV_COPIED=""
