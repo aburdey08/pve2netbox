@@ -1,5 +1,16 @@
 # pve2netbox
 
+## [1.0.2] - 2026-02-17
+
+### Fixed
+
+- VM matching by name+cluster when vmid is missing; sync no longer aborts on single VM/LXC failure; in combined mode, failed initial full sync triggers full retry on next cycle.
+
+### Added
+
+- VM index by `(name, cluster_id)` and per-VM/LXC error handling with clear messages.
+
+
 ## [1.0.0] - 2026-02-14
 
 Project renamed to **pve2netbox** (formerly a fork of [creekorful/netbox-pve-sync](https://github.com/creekorful/netbox-pve-sync) v0.2.4) with extended functionality.

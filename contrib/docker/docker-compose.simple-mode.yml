@@ -1,6 +1,6 @@
 # Simple mode: full sync on interval (suitable for <50 VMs).
 # From repo root: edit values below, then:
-#   docker compose -f contrib/docker/docker-compose.simple-mode.yml up -d --build
+#   docker compose -f contrib/docker/docker-compose.simple-mode.yml up -d
 
 services:
   pve2netbox:

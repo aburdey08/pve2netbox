@@ -201,6 +201,7 @@ def _load_nb_objects(_nb_api: pynetbox.api) -> dict:
     _nb_objects = {
         'devices': {},
         'virtual_machines': {},
+        'virtual_machines_by_name_cluster': {},
         'virtual_machines_interfaces': {},
         'mac_addresses': {},
         'prefixes': {},
@@ -216,7 +217,7 @@ def _load_nb_objects(_nb_api: pynetbox.api) -> dict:
     logger.debug('  - Loading virtual machines...')
     vm_ids = []
     for _nb_virtual_machine in _nb_api.virtualization.virtual_machines.all():
-        _nb_objects['virtual_machines'][_nb_virtual_machine.serial] = _nb_virtual_machine
+        _index_nb_virtual_machine(_nb_objects, _nb_virtual_machine)
         vm_ids.append(_nb_virtual_machine.id)
     logger.debug('  - Loading interfaces...')
     interfaces_list = list(_nb_api.virtualization.interfaces.all())
@@ -286,6 +287,54 @@ def _get_role_id(_nb_objects: dict, role_name_or_id: Optional[str]) -> Optional[
     return None
 
 
+def _index_nb_virtual_machine(_nb_objects: dict, _nb_virtual_machine: Any) -> None:
+    """Index VM in local caches by serial and by (name, cluster_id)."""
+    serial = getattr(_nb_virtual_machine, 'serial', None)
+    if serial not in (None, ''):
+        _nb_objects['virtual_machines'][str(serial)] = _nb_virtual_machine
+
+    cluster = getattr(_nb_virtual_machine, 'cluster', None)
+    cluster_id = getattr(cluster, 'id', None)
+    name = getattr(_nb_virtual_machine, 'name', None)
+    if cluster_id is not None and name:
+        _nb_objects['virtual_machines_by_name_cluster'][(name, int(cluster_id))] = _nb_virtual_machine
+
+
+def _get_nb_vm_for_sync(
+        _nb_api: pynetbox.api,
+        _nb_objects: dict,
+        vmid: int,
+        vm_name: str,
+) -> Optional[Any]:
+    """
+    Find existing NetBox VM for sync.
+    First try serial=vmid cache, then fallback to unique (name, cluster_id).
+    """
+    vm = _nb_objects['virtual_machines'].get(str(vmid))
+    if vm is not None:
+        return vm
+
+    cluster_id = int(os.environ.get('NB_CLUSTER_ID', 1))
+    vm = _nb_objects['virtual_machines_by_name_cluster'].get((vm_name, cluster_id))
+    if vm is not None:
+        return vm
+
+    # Important for quick sync: changed VM may not be preloaded if serial is empty.
+    try:
+        candidates = list(_nb_api.virtualization.virtual_machines.filter(name=vm_name, cluster_id=cluster_id))
+    except Exception as e:
+        logger.warning(f'Failed to load VM by name/cluster ({vm_name}, {cluster_id}): {e}')
+        return None
+
+    if not candidates:
+        return None
+
+    vm = candidates[0]
+    _index_nb_virtual_machine(_nb_objects, vm)
+    logger.info(f'      Matched existing NetBox VM by name+cluster: {vm_name} (cluster {cluster_id})')
+    return vm
+
+
 def _process_pve_lxc_container(
         _pve_api: ProxmoxAPI,
         _nb_api: pynetbox.api,
@@ -304,11 +353,12 @@ def _process_pve_lxc_container(
     _pve_node_name = _nb_device.name.lower()
     pve_container_config = _pve_api.nodes(_pve_node_name).lxc(_pve_container['vmid']).config.get()
     lxc_role_id = _get_role_id(_nb_objects, os.getenv('LXC_ROLE'))
-    nb_virtual_machine = _nb_objects['virtual_machines'].get(str(_pve_container['vmid']))
+    vm_name = pve_container_config.get('hostname', _pve_container['name'])
+    nb_virtual_machine = _get_nb_vm_for_sync(_nb_api, _nb_objects, _pve_container['vmid'], vm_name)
     if nb_virtual_machine is None:
         create_params = {
             'serial': _pve_container['vmid'],
-            'name': pve_container_config.get('hostname', _pve_container['name']),
+            'name': vm_name,
             'site': _nb_device.site.id,
             'cluster': os.environ.get('NB_CLUSTER_ID', 1),
             'device': _nb_device.id,
@@ -326,9 +376,10 @@ def _process_pve_lxc_container(
             create_params['role'] = lxc_role_id
         
         nb_virtual_machine = _nb_api.virtualization.virtual_machines.create(**create_params)
-        _nb_objects['virtual_machines'][str(_pve_container['vmid'])] = nb_virtual_machine
+        _index_nb_virtual_machine(_nb_objects, nb_virtual_machine)
     else:
-        nb_virtual_machine.name = pve_container_config.get('hostname', _pve_container['name'])
+        nb_virtual_machine.serial = _pve_container['vmid']
+        nb_virtual_machine.name = vm_name
         nb_virtual_machine.site = _nb_device.site.id
         nb_virtual_machine.cluster = os.environ.get('NB_CLUSTER_ID', 1)
         nb_virtual_machine.device = _nb_device.id
@@ -342,6 +393,7 @@ def _process_pve_lxc_container(
         nb_virtual_machine.custom_fields['replicated'] = _is_replicated
         nb_virtual_machine.custom_fields['ha'] = _has_ha
         nb_virtual_machine.save()
+        _index_nb_virtual_machine(_nb_objects, nb_virtual_machine)
     _process_pve_lxc_network_interfaces(
         _nb_api,
         _nb_objects,
@@ -424,11 +476,12 @@ def _process_pve_virtual_machine(
     if agent_enabled and vm_is_running and agent_data_by_mac:
         logger.debug(f'      Total agent interfaces found: {len(agent_data_by_mac)} (will match with Proxmox config by MAC)')
     vm_role_id = _get_role_id(_nb_objects, os.getenv('VM_ROLE'))
-    nb_virtual_machine = _nb_objects['virtual_machines'].get(str(_pve_virtual_machine['vmid']))
+    vm_name = _pve_virtual_machine['name']
+    nb_virtual_machine = _get_nb_vm_for_sync(_nb_api, _nb_objects, _pve_virtual_machine['vmid'], vm_name)
     if nb_virtual_machine is None:
         create_params = {
             'serial': _pve_virtual_machine['vmid'],
-            'name': _pve_virtual_machine['name'],
+            'name': vm_name,
             'site': _nb_device.site.id,
             'cluster': os.environ.get('NB_CLUSTER_ID', 1),
             'device': _nb_device.id,
@@ -446,8 +499,10 @@ def _process_pve_virtual_machine(
             create_params['role'] = vm_role_id
         
         nb_virtual_machine = _nb_api.virtualization.virtual_machines.create(**create_params)
+        _index_nb_virtual_machine(_nb_objects, nb_virtual_machine)
     else:
-        nb_virtual_machine.name = _pve_virtual_machine['name']
+        nb_virtual_machine.serial = _pve_virtual_machine['vmid']
+        nb_virtual_machine.name = vm_name
         nb_virtual_machine.site = _nb_device.site.id
         nb_virtual_machine.cluster = os.environ.get('NB_CLUSTER_ID', 1)
         nb_virtual_machine.device = _nb_device.id
@@ -461,6 +516,7 @@ def _process_pve_virtual_machine(
         nb_virtual_machine.custom_fields['replicated'] = _is_replicated
         nb_virtual_machine.custom_fields['ha'] = _has_ha
         nb_virtual_machine.save()
+        _index_nb_virtual_machine(_nb_objects, nb_virtual_machine)
     _process_pve_virtual_machine_network_interfaces(
         _nb_api,
         _nb_objects,
@@ -1052,6 +1108,7 @@ def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: list[int]) -> 
     _nb_objects = {
         'devices': {},
         'virtual_machines': {},
+        'virtual_machines_by_name_cluster': {},
         'virtual_machines_interfaces': {},
         'mac_addresses': {},
         'prefixes': {},
@@ -1069,7 +1126,7 @@ def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: list[int]) -> 
         try:
             vms = _nb_api.virtualization.virtual_machines.filter(serial=str(vmid))
             for vm in vms:
-                _nb_objects['virtual_machines'][vm.serial] = vm
+                _index_nb_virtual_machine(_nb_objects, vm)
         except Exception as e:
             logger.warning(f'Failed to load VM {vmid}: {e}')
     logger.debug('  - Loading interfaces for changed VMs...')
@@ -1176,6 +1233,7 @@ def sync_specific_vms(
             for ct in _pve_api.nodes(node_name).lxc.get():
                 if ct['vmid'] in _changed_vmids:
                     vms_by_node[node_name]['lxc'].append(ct)
+    sync_errors = 0
     for node_name, vms in vms_by_node.items():
         if not vms['qemu'] and not vms['lxc']:
             continue
@@ -1193,30 +1251,47 @@ def sync_specific_vms(
         nb_device.save()
         for vm in vms['qemu']:
             logger.info(f'    Quick sync VM: {vm["name"]} (ID: {vm["vmid"]})')
-            _process_pve_virtual_machine(
-                _pve_api,
-                _nb_api,
-                nb_objects,
-                nb_device,
-                pve_vm_tags.get(vm['vmid'], []),
-                vm,
-                vm['vmid'] in pve_replicated_virtual_machine_ids,
-                vm['vmid'] in pve_ha_virtual_machine_ids,
-            )
+            try:
+                _process_pve_virtual_machine(
+                    _pve_api,
+                    _nb_api,
+                    nb_objects,
+                    nb_device,
+                    pve_vm_tags.get(vm['vmid'], []),
+                    vm,
+                    vm['vmid'] in pve_replicated_virtual_machine_ids,
+                    vm['vmid'] in pve_ha_virtual_machine_ids,
+                )
+            except Exception as e:
+                sync_errors += 1
+                logger.error(
+                    f'    Failed quick sync for VM {vm["name"]} (ID: {vm["vmid"]}): {e}',
+                    exc_info=True,
+                )
         for ct in vms['lxc']:
             logger.info(f'    Quick sync LXC: {ct["name"]} (ID: {ct["vmid"]})')
-            _process_pve_lxc_container(
-                _pve_api,
-                _nb_api,
-                nb_objects,
-                nb_device,
-                pve_vm_tags.get(ct['vmid'], []),
-                ct,
-                ct['vmid'] in pve_replicated_virtual_machine_ids,
-                ct['vmid'] in pve_ha_virtual_machine_ids,
-            )
-    
-    logger.info('Quick sync completed successfully!')
+            try:
+                _process_pve_lxc_container(
+                    _pve_api,
+                    _nb_api,
+                    nb_objects,
+                    nb_device,
+                    pve_vm_tags.get(ct['vmid'], []),
+                    ct,
+                    ct['vmid'] in pve_replicated_virtual_machine_ids,
+                    ct['vmid'] in pve_ha_virtual_machine_ids,
+                )
+            except Exception as e:
+                sync_errors += 1
+                logger.error(
+                    f'    Failed quick sync for LXC {ct["name"]} (ID: {ct["vmid"]}): {e}',
+                    exc_info=True,
+                )
+
+    if sync_errors:
+        logger.warning(f'Quick sync completed with {sync_errors} error(s).')
+    else:
+        logger.info('Quick sync completed successfully!')
 
 
 def cleanup_stale_vms(nb_api: pynetbox.api, nb_objects: dict, current_vmids: set, dry_run: bool = False) -> None:
@@ -1316,6 +1391,7 @@ def main():
     vm_count = 0
     lxc_count = 0
     
+    sync_errors = 0
     for pve_node in pve_api.nodes.get():
         logger.info(f'  Processing node: {pve_node["node"]}')
         pve_replicated_virtual_machine_ids = list(
@@ -1335,37 +1411,57 @@ def main():
                 current_vmids.add(pve_virtual_machine["vmid"])
                 vm_count += 1
                 metrics.record_vm_sync()
-                _process_pve_virtual_machine(
-                    pve_api,
-                    nb_api,
-                    nb_objects,
-                    nb_device,
-                    pve_vm_tags.get(pve_virtual_machine['vmid'], []),
-                    pve_virtual_machine,
-                    pve_virtual_machine['vmid'] in pve_replicated_virtual_machine_ids,
-                    pve_virtual_machine['vmid'] in pve_ha_virtual_machine_ids,
-                )
+                try:
+                    _process_pve_virtual_machine(
+                        pve_api,
+                        nb_api,
+                        nb_objects,
+                        nb_device,
+                        pve_vm_tags.get(pve_virtual_machine['vmid'], []),
+                        pve_virtual_machine,
+                        pve_virtual_machine['vmid'] in pve_replicated_virtual_machine_ids,
+                        pve_virtual_machine['vmid'] in pve_ha_virtual_machine_ids,
+                    )
+                except Exception as e:
+                    sync_errors += 1
+                    logger.error(
+                        f'    Failed sync for VM {pve_virtual_machine["name"]} '
+                        f'(ID: {pve_virtual_machine["vmid"]}): {e}',
+                        exc_info=True,
+                    )
         if _config.sync_lxc:
             for pve_container in pve_api.nodes(pve_node['node']).lxc.get():
                 logger.info(f'    Processing LXC: {pve_container["name"]} (ID: {pve_container["vmid"]})')
                 current_vmids.add(pve_container["vmid"])
                 lxc_count += 1
                 metrics.record_lxc_sync()
-                _process_pve_lxc_container(
-                    pve_api,
-                    nb_api,
-                    nb_objects,
-                    nb_device,
-                    pve_vm_tags.get(pve_container['vmid'], []),
-                    pve_container,
-                    pve_container['vmid'] in pve_replicated_virtual_machine_ids,
-                    pve_container['vmid'] in pve_ha_virtual_machine_ids,
-                )
+                try:
+                    _process_pve_lxc_container(
+                        pve_api,
+                        nb_api,
+                        nb_objects,
+                        nb_device,
+                        pve_vm_tags.get(pve_container['vmid'], []),
+                        pve_container,
+                        pve_container['vmid'] in pve_replicated_virtual_machine_ids,
+                        pve_container['vmid'] in pve_ha_virtual_machine_ids,
+                    )
+                except Exception as e:
+                    sync_errors += 1
+                    logger.error(
+                        f'    Failed sync for LXC {pve_container["name"]} '
+                        f'(ID: {pve_container["vmid"]}): {e}',
+                        exc_info=True,
+                    )
     if _config.enable_cleanup:
         cleanup_stale_vms(nb_api, nb_objects, current_vmids, _config.dry_run)
     metrics.record_full_sync_end(sync_start_time, vm_count, lxc_count)
     
-    log_section('Sync completed successfully!')
+    if sync_errors:
+        log_section('Sync completed with errors')
+        logger.warning(f'Sync finished with {sync_errors} error(s)')
+    else:
+        log_section('Sync completed successfully!')
     logger.info(f'Synchronized {vm_count} VMs and {lxc_count} LXC containers')
     logger.info(f'Duration: {time.time() - sync_start_time:.2f}s')
 

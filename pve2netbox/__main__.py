@@ -66,19 +66,25 @@ if __name__ == '__main__':
         last_full_sync = 0
 
         log_section('Initial full sync')
+        initial_full_sync_ok = False
         try:
             sync_start = metrics.record_full_sync_start()
             main()
+            initial_full_sync_ok = True
         except Exception as e:
             logger.error(f'Error during initial sync: {e}', exc_info=True)
             metrics.record_error()
-        last_full_sync = time.time()
+        last_full_sync = time.time() if initial_full_sync_ok else 0
         log_subsection('Initializing quick check state')
         try:
             _, last_quick_state = quick_check_changes_new(pve_api, {}, config)
         except Exception:
             _, last_quick_state = quick_check_changes(pve_api, {})
         logger.info(f'Tracking {len(last_quick_state)} VMs for changes')
+        if not initial_full_sync_ok:
+            logger.warning(
+                'Initial full sync failed; scheduled full sync retry will run on next cycle.'
+            )
 
         while True:
             time.sleep(quick_check_interval)

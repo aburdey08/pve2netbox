@@ -1,6 +1,6 @@
 # Combined mode: quick checks + full sync (recommended for >50 VMs).
 # From repo root: edit values below, then:
-#   docker compose -f contrib/docker/docker-compose.combined-mode.yml up -d --build
+#   docker compose -f contrib/docker/docker-compose.combined-mode.yml up -d
 
 services:
   pve2netbox:

@@ -50,8 +50,8 @@ Run all commands **from the repository root**.
 | Mode | Command |
 |------|---------|
 | **1. Single-run** | `docker compose -f contrib/docker/docker-compose.single-run.yml run --rm pve2netbox` |
-| **2. Simple** | `docker compose -f contrib/docker/docker-compose.simple-mode.yml up -d --build` |
-| **3. Combined** | `docker compose -f contrib/docker/docker-compose.combined-mode.yml up -d --build` |
+| **2. Simple** | `docker compose -f contrib/docker/docker-compose.simple-mode.yml up -d |
+| **3. Combined** | `docker compose -f contrib/docker/docker-compose.combined-mode.yml up -d |
 
 ## Check
 
