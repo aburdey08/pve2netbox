@@ -1,4 +1,6 @@
 # pve2netbox
+[![Docker Hub](https://img.shields.io/badge/Docker%20Hub-0db7ed?logo=docker&logoColor=white)](https://hub.docker.com/r/aburdey/pve2netbox)
+
 
 Yes, another Proxmox Virtual Environment (PVE) inventory sync to NetBox. Based on [creekorful/netbox-pve-sync](https://github.com/creekorful/netbox-pve-sync). I liked its approach and initially planned to fix a few issues, but it grew into a small standalone project.
 
