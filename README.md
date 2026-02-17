@@ -14,7 +14,7 @@ The following options are available:
 |--------|---------------|---------------|
 | **pip3** (local build) | Environment variables or `.env` | see below |
 | **Docker** — **Recommended!** | Parameters in compose files `contrib/docker/docker-compose.*.yml` | [contrib/docker/](contrib/docker/) |
-| **LXC** (including Proxmox) — **Recommended!** | `/etc/pve2netbox/env` or `.env` | [contrib/lxc/](contrib/lxc/) |
+| **LXC** — **Recommended!** | `/etc/pve2netbox/env` or `.env` | [contrib/lxc/](contrib/lxc/) |
 | **systemd** (host/LXC without Docker) | `/etc/pve2netbox/env` | [contrib/systemd/](contrib/systemd/) |
 
 Quick start and variable descriptions are in each category per the table above.

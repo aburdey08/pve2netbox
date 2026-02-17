@@ -19,7 +19,7 @@ chmod +x deploy-from-pve.sh
 ./deploy-from-pve.sh
 ```
 
-**Config from .env:** if a `.env` file exists next to the script (`contrib/lxc/.env`), in `contrib/`, or in the repo root (`.env`), it is copied into the container as `/etc/pve2netbox/env` — no need to fill config manually.
+**Config from .env:** put `.env` in the same directory as `deploy-from-pve.sh`). It will be copied into the container as `/etc/pve2netbox/env` — no need to fill config manually. If not found there, the script also looks in `contrib/` and the repo root.
 
 **Parameters** (environment variables): `CTID`, `STORAGE`, `BRIDGE`, `HOSTNAME`, `ROOTFS_SIZE`, `MEMORY`, `TEMPLATE_STORAGE`. Defaults: CTID — first free, HOSTNAME — `lxc-pve2netbox`. Examples: `CTID=201 BRIDGE=vmbr1 ./deploy-from-pve.sh`, `./deploy-from-pve.sh --no-install` (create LXC only).
 
