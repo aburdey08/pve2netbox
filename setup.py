@@ -6,7 +6,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="pve2netbox",
-    version="1.0.2",
+    version="1.0.3",
     install_requires=[
         "pynetbox>=7.4",
         "proxmoxer>=2.2",

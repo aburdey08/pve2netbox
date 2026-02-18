@@ -719,6 +719,47 @@ def _process_pve_virtual_machine_network_interface(
             nb_virtual_machines_interface.primary_mac_address = nb_mac_address.id
             nb_virtual_machines_interface.save()
     agent_ip_addresses = _agent_interface_data.get('ip_addresses', [])
+    has_agent_match = bool(_agent_interface_data)
+
+    if has_agent_match:
+        desired_interface_ips = set()
+        for ip_info in agent_ip_addresses:
+            ip_addr = ip_info.get('address')
+            ip_prefix = ip_info.get('prefix')
+            if ip_addr and ip_prefix is not None:
+                desired_interface_ips.add(f'{ip_addr}/{ip_prefix}')
+
+        # Keep NetBox interface IPs aligned with guest agent state.
+        for nb_ip in list(_nb_objects['ip_addresses'].values()):
+            assigned_type = getattr(nb_ip, 'assigned_object_type', None)
+            assigned_id = getattr(nb_ip, 'assigned_object_id', None)
+            ip_address = str(getattr(nb_ip, 'address', ''))
+
+            if assigned_type != 'virtualization.vminterface':
+                continue
+            if assigned_id != nb_virtual_machines_interface.id:
+                continue
+            if ip_address in desired_interface_ips:
+                continue
+
+            vm_needs_save = False
+            if hasattr(_nb_virtual_machine, 'primary_ip4') and _nb_virtual_machine.primary_ip4:
+                if _nb_virtual_machine.primary_ip4.id == nb_ip.id:
+                    _nb_virtual_machine.primary_ip4 = None
+                    vm_needs_save = True
+            if hasattr(_nb_virtual_machine, 'primary_ip6') and _nb_virtual_machine.primary_ip6:
+                if _nb_virtual_machine.primary_ip6.id == nb_ip.id:
+                    _nb_virtual_machine.primary_ip6 = None
+                    vm_needs_save = True
+            if vm_needs_save:
+                _nb_virtual_machine.save()
+
+            removed_ip_address = ip_address
+            nb_ip.delete()
+            if removed_ip_address in _nb_objects['ip_addresses']:
+                _nb_objects['ip_addresses'].pop(removed_ip_address, None)
+            logger.info(f'        ✓ Removed stale IP {removed_ip_address} from interface {_interface_name}')
+
     if not agent_ip_addresses:
         logger.debug(f'        Interface {_interface_name}: no IP addresses from guest agent')
         return _nb_objects

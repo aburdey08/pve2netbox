@@ -1,5 +1,11 @@
 # pve2netbox
 
+## [1.0.3] - 2026-02-18
+
+### Fixed
+
+- **QEMU guest agent**: when syncing VM interfaces, IP addresses no longer reported by the guest agent are now removed from the interface in NetBox (previously only new IPs were added; stale ones were left).
+
 ## [1.0.2] - 2026-02-17
 
 ### Fixed
