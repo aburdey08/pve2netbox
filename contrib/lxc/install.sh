@@ -46,15 +46,19 @@ fi
 # Config directory
 mkdir -p "$INSTALL_DIR"
 
-# Environment file
-if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/.env.example" ]]; then
-  cp "$SCRIPT_DIR/.env.example" "$INSTALL_DIR/env"
-  echo "[*] Copied $INSTALL_DIR/env from .env.example — edit and fill in secrets."
+# Environment file (do not overwrite existing — for updates from inside LXC)
+if [[ -f "$INSTALL_DIR/env" ]]; then
+  echo "[*] Keeping existing $INSTALL_DIR/env"
 else
-  curl -sL "$REPO_RAW/.env.example" -o "$INSTALL_DIR/env"
-  echo "[*] Downloaded $INSTALL_DIR/env — edit and fill in secrets."
+  if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/.env.example" ]]; then
+    cp "$SCRIPT_DIR/.env.example" "$INSTALL_DIR/env"
+    echo "[*] Copied $INSTALL_DIR/env from .env.example — edit and fill in secrets."
+  else
+    curl -sL "$REPO_RAW/.env.example" -o "$INSTALL_DIR/env"
+    echo "[*] Downloaded $INSTALL_DIR/env — edit and fill in secrets."
+  fi
+  chmod 600 "$INSTALL_DIR/env"
 fi
-chmod 600 "$INSTALL_DIR/env"
 
 # Systemd units
 download_unit() {

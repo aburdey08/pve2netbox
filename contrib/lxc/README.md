@@ -60,6 +60,16 @@ With systemd in LXC: file **`/etc/pve2netbox/env`** (format `KEY=value`, no `exp
 
 Full sample: [.env.example](../../.env.example).
 
+
+## Update
+
+From inside the container, run the install script (it will not overwrite existing `/etc/pve2netbox/env`), then restart the service:
+
+```bash
+curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/install.sh | bash
+systemctl restart pve2netbox
+```
+
 ## Install into an existing LXC
 
 Enter the container (`pct enter <CTID>`), then:
@@ -67,7 +77,7 @@ Enter the container (`pct enter <CTID>`), then:
 **Option A** — one command (install from git repo + unit files and env from GitHub):
 
 ```bash
-curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/install.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/install.sh | bash
 ```
 
 **Option B** — from repo:

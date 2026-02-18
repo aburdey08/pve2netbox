@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pve2netbox"
-version = "1.0.0"
+version = "1.0.2"
 authors = [
     { name = "Andrew Burdey", email = "a.burdey08@gmail.com" },
 ]
