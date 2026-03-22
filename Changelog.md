@@ -1,5 +1,11 @@
 # pve2netbox
 
+## [1.0.4] - 2026-03-21
+
+### Added
+
+- **Proxmox tag sync to NetBox** — native VM/LXC tags from Proxmox (semicolon-separated in cluster resources) are created in NetBox when missing and assigned to the matching virtual machines together with existing pool tags (`Pool/<poolid>`). New env var **SYNC_TAGS** (default `true`); set `SYNC_TAGS=false` to keep only pool tags. Documented in README, `.env.example`, and `contrib/` samples (Docker, LXC, systemd).
+
 ## [1.0.3] - 2026-02-18
 
 ### Fixed

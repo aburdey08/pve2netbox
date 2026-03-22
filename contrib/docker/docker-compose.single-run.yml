@@ -4,7 +4,7 @@
 
 services:
   pve2netbox:
-    image: aburdey/pve2netbox:1.0.3
+    image: aburdey/pve2netbox:1.0.4
     environment:
       # PVE API (required — replace with your values)
       - PVE_API_HOST=10.10.0.10
@@ -22,6 +22,7 @@ services:
       - NB_API_RETRY_BACKOFF=1.0
       - SYNC_VMS=true
       - SYNC_LXC=true
+      - SYNC_TAGS=true
       - VM_ROLE=Virtual Machine
       - LXC_ROLE=LXC
       # Single-run mode: do not set SYNC_INTERVAL_SECONDS and QUICK_CHECK_INTERVAL_SECONDS

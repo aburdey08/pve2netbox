@@ -14,7 +14,7 @@ class Config:
     Proxmox: pve_api_host, pve_api_user, pve_api_token, pve_api_secret, pve_api_verify_ssl.
     NetBox: nb_api_url, nb_api_token, nb_cluster_id, nb_api_delay_seconds,
     nb_api_retry_total, nb_api_retry_backoff.
-    Sync: sync_vms, sync_lxc, sync_interval_seconds, quick_check_interval_seconds.
+    Sync: sync_vms, sync_lxc, sync_tags, sync_interval_seconds, quick_check_interval_seconds.
     Roles: vm_role, lxc_role (optional device role names).
     Feature flags: dry_run, enable_cleanup, enable_metrics, metrics_port.
     """
@@ -31,6 +31,7 @@ class Config:
     nb_api_retry_backoff: float
     sync_vms: bool
     sync_lxc: bool
+    sync_tags: bool
     sync_interval_seconds: Optional[float]
     quick_check_interval_seconds: Optional[float]
     vm_role: Optional[str]
@@ -96,6 +97,7 @@ def load_config() -> Config:
             nb_api_retry_backoff=float(os.getenv('NB_API_RETRY_BACKOFF', '1.0')),
             sync_vms=os.getenv('SYNC_VMS', 'true').lower() == 'true',
             sync_lxc=os.getenv('SYNC_LXC', 'true').lower() == 'true',
+            sync_tags=os.getenv('SYNC_TAGS', 'true').lower() == 'true',
             sync_interval_seconds=float(os.getenv('SYNC_INTERVAL_SECONDS')) 
                 if os.getenv('SYNC_INTERVAL_SECONDS') else None,
             quick_check_interval_seconds=float(os.getenv('QUICK_CHECK_INTERVAL_SECONDS'))

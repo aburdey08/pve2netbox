@@ -39,6 +39,7 @@ sudo systemctl daemon-reload
 | **QUICK_CHECK_INTERVAL_SECONDS** | no | Quick check interval, sec (mode 3, e.g. `60`) |
 | **SYNC_VMS** | no | Sync QEMU VMs (`true`/`false`, default `true`) |
 | **SYNC_LXC** | no | Sync LXC (`true`/`false`, default `true`) |
+| **SYNC_TAGS** | no | Sync Proxmox tags to NetBox VMs (`true`/`false`, default `true`) |
 | **VM_ROLE** | no | NetBox device role name or ID for VMs (e.g. `Virtual Machine`) |
 | **LXC_ROLE** | no | NetBox device role name or ID for LXC (e.g. `Container`) |
 | **DRY_RUN** | no | Check only, no changes (`true`/`false`) |

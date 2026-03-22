@@ -276,6 +276,15 @@ def _process_pve_tags(
     return _nb_objects
 
 
+def _ensure_nb_tag(tag_name: str, _nb_api: pynetbox.api, _nb_objects: dict) -> None:
+    """Create a NetBox tag for ``tag_name`` if it does not already exist."""
+    if tag_name in _nb_objects['tags']:
+        return
+    slug = tag_name.lower().replace(' ', '-')
+    _nb_tag = _nb_api.extras.tags.create(name=tag_name, slug=slug)
+    _nb_objects['tags'][_nb_tag.name] = _nb_tag
+
+
 def _get_role_id(_nb_objects: dict, role_name_or_id: Optional[str]) -> Optional[int]:
     """Resolve device role ID by name or ID (e.g. from VM_ROLE/LXC_ROLE env)."""
     if not role_name_or_id:
@@ -1249,8 +1258,12 @@ def sync_specific_vms(
             pve_vm_tags[pve_vm_resource['vmid']] = []
             if 'pool' in pve_vm_resource:
                 pve_vm_tags[pve_vm_resource['vmid']].append(f'Pool/{pve_vm_resource["pool"]}')
-            if 'tags' in pve_vm_resource:
-                pass  # TODO: add tags support
+            if _config.sync_tags and 'tags' in pve_vm_resource:
+                for _raw_tag in pve_vm_resource['tags'].split(';'):
+                    _tag_name = _raw_tag.strip()
+                    if _tag_name:
+                        _ensure_nb_tag(_tag_name, _nb_api, nb_objects)
+                        pve_vm_tags[pve_vm_resource['vmid']].append(_tag_name)
     
     pve_ha_virtual_machine_ids = list(
         map(
@@ -1419,8 +1432,12 @@ def main():
         if 'pool' in pve_vm_resource:
             pve_vm_tags[pve_vm_resource['vmid']].append(f'Pool/{pve_vm_resource["pool"]}')
 
-        if 'tags' in pve_vm_resource:
-            pass  # TODO: pve_vm_tags[pve_vm_resource['vmid']].append(pve_vm_resource['tags'])
+        if _config.sync_tags and 'tags' in pve_vm_resource:
+            for _raw_tag in pve_vm_resource['tags'].split(';'):
+                _tag_name = _raw_tag.strip()
+                if _tag_name:
+                    _ensure_nb_tag(_tag_name, nb_api, nb_objects)
+                    pve_vm_tags[pve_vm_resource['vmid']].append(_tag_name)
 
     pve_ha_virtual_machine_ids = list(
         map(

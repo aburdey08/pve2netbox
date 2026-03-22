@@ -44,6 +44,7 @@ Selective sync:
 
 - **SYNC_VMS**: Sync QEMU VMs (default: `true`).
 - **SYNC_LXC**: Sync LXC containers (default: `true`).
+- **SYNC_TAGS**: Sync tags from Proxmox VE to NetBox virtual machines (default: `true`). Tags are created in NetBox automatically if missing and assigned to each VM/LXC according to its current tags in PVE. Set to `false` to disable tag sync entirely.
 
 Device roles (optional):
 
@@ -115,6 +116,16 @@ Or without installing to PATH (from repo root after step 1): `python -m pve2netb
 Commands for LXC, Docker, and systemd are in [Deploy and run](#deploy-and-run).
 
 ## Other options
+
+### Tag sync
+
+Tags assigned to VMs and LXC containers in Proxmox VE are synced to the corresponding virtual machines in NetBox. Tags are created in NetBox automatically on first use and kept in sync on every run.
+
+Enabled by default. To disable:
+
+```bash
+SYNC_TAGS=false
+```
 
 ### Dry-run mode
 
