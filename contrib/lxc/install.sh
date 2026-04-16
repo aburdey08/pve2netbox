@@ -75,11 +75,43 @@ download_unit "pve2netbox-oneshot.service"
 download_unit "pve2netbox.timer"
 systemctl daemon-reload
 
+# Restart already-running services (handles package updates gracefully)
+restarted=()
+if systemctl is-active --quiet pve2netbox.service; then
+  systemctl restart pve2netbox.service
+  restarted+=("pve2netbox.service")
+fi
+if systemctl is-active --quiet pve2netbox.timer; then
+  systemctl restart pve2netbox.timer
+  restarted+=("pve2netbox.timer")
+fi
+
 echo ""
-echo "[OK] Installation complete."
-echo "  1. Edit $INSTALL_DIR/env (PVE_API_*, NB_API_*, and intervals if needed)."
-echo "  2. Enable the service:"
-echo "     systemctl enable --now pve2netbox     # long-running (recommended)"
-echo "     or to run on a 5-minute timer:"
-echo "     systemctl enable --now pve2netbox.timer"
+echo "========================================================"
+echo "  [OK] pve2netbox installation complete"
+echo "========================================================"
+echo ""
+
+if [[ ${#restarted[@]} -gt 0 ]]; then
+  echo "  Restarted active units: ${restarted[*]}"
+  echo ""
+fi
+
+echo "  Next steps:"
+echo ""
+echo "    1) Edit the environment file:"
+echo "         $INSTALL_DIR/env"
+echo "       (set PVE_API_*, NB_API_*, and intervals if needed)"
+echo ""
+echo "    2) Enable the service (pick one):"
+echo ""
+echo "       - Long-running daemon (recommended):"
+echo "           systemctl enable --now pve2netbox.service"
+echo ""
+echo "       - Periodic one-shot via 5-minute timer:"
+echo "           systemctl enable --now pve2netbox.timer"
+echo ""
+echo "    3) Check status / logs:"
+echo "           systemctl status pve2netbox.service"
+echo "           journalctl -u pve2netbox.service -f"
 echo ""

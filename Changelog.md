@@ -6,6 +6,10 @@
 
 - **Stale VM disks cleanup**: when a disk is moved to another Proxmox storage, its path (NetBox disk `name`) changes and a new entry was previously added without removing the old one. The sync now tracks disks seen in the current Proxmox config and deletes obsolete `VirtualDisk` records from NetBox for both QEMU VMs and LXC containers.
 
+### Changed
+
+- **LXC installer auto-restart on update**: `contrib/lxc/install.sh` now detects already-running `pve2netbox.service` / `pve2netbox.timer` units and restarts them automatically after re-running the installer, so in-place upgrades pick up the new code without manual `systemctl restart`.
+
 ## [1.0.4] - 2026-03-21
 
 ### Added
