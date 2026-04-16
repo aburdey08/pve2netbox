@@ -1,17 +1,14 @@
-# LXC: pve2netbox (including Proxmox VE)
+# LXC: pve2netbox
 
-Deploy in an LXC container. Operation modes are the same as in the [main README](../../README.md#operation-modes-shared-by-docker-lxc-systemd). Inside the container, systemd is used ([contrib/systemd/](../systemd/)).
+Run pve2netbox inside an LXC container on Proxmox VE. Inside the container the app is managed by systemd ([contrib/systemd/](../systemd/)).
 
-## One-command deploy from PVE host — **Recommended!**
+---
 
-The **deploy-from-pve.sh** script creates an LXC (Debian 12), starts it, and installs pve2netbox. Run **on a Proxmox node as root**.
+## Quick start — one command from a Proxmox node
 
-```bash
-# Interactively prompts for: container ID, name, storage
-./deploy-from-pve.sh
-```
+The **`deploy-from-pve.sh`** script creates a Debian 12 LXC, starts it, and installs pve2netbox.
 
-Or without cloning the repo:
+Run **on a Proxmox VE node as root**:
 
 ```bash
 curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/deploy-from-pve.sh -o deploy-from-pve.sh
@@ -19,102 +16,114 @@ chmod +x deploy-from-pve.sh
 ./deploy-from-pve.sh
 ```
 
-**Config from .env:** put `.env` in the same directory as `deploy-from-pve.sh`). It will be copied into the container as `/etc/pve2netbox/env` — no need to fill config manually. If not found there, the script also looks in `contrib/` and the repo root.
+Interactively asks for: container ID, hostname, storage.
 
-**Parameters** (environment variables): `CTID`, `STORAGE`, `BRIDGE`, `HOSTNAME`, `ROOTFS_SIZE`, `MEMORY`, `TEMPLATE_STORAGE`. Defaults: CTID — first free, HOSTNAME — `lxc-pve2netbox`. Examples: `CTID=201 BRIDGE=vmbr1 ./deploy-from-pve.sh`, `./deploy-from-pve.sh --no-install` (create LXC only).
+### Tip: pre-fill config with `.env` — no manual edit needed
 
-After deploy: edit `/etc/pve2netbox/env` if needed, then `systemctl enable --now pve2netbox` (from inside the container or `pct exec <CTID> -- systemctl enable --now pve2netbox`).
+If a **`.env`** file sits **next to** `deploy-from-pve.sh`, the script copies it into the container as `/etc/pve2netbox/env` automatically — so the service is fully configured right after deploy. Fallback search paths: `../` and `../../` (i.e. repo root).
+
+Recommended flow:
+
+```bash
+# 1. Get the mode sample (Combined — recommended) and the deploy script:
+curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/env.combined-mode -o .env
+curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/deploy-from-pve.sh -o deploy-from-pve.sh
+chmod +x deploy-from-pve.sh
+
+# 2. Fill in PVE_API_* and NB_API_* in .env:
+$EDITOR .env
+
+# 3. Deploy — .env is picked up automatically:
+./deploy-from-pve.sh
+```
+
+Other mode samples: `env.single-run`, `env.simple-mode` (same directory).
+
+### After deploy — enable the service
+
+```bash
+# If you used the .env trick above — config is ready, just start:
+pct exec <CTID> -- systemctl enable --now pve2netbox
+
+# Otherwise — edit first, then start:
+pct exec <CTID> -- nano /etc/pve2netbox/env
+pct exec <CTID> -- systemctl enable --now pve2netbox
+```
+
+Check:
+
+```bash
+pct exec <CTID> -- systemctl status pve2netbox
+pct exec <CTID> -- journalctl -u pve2netbox -f
+```
+
+### Script parameters
+
+Passed as environment variables: `CTID`, `STORAGE`, `BRIDGE`, `LXC_HOSTNAME`, `ROOTFS_SIZE`, `MEMORY`, `TEMPLATE_STORAGE`.
+
+Defaults: `CTID` — first free starting at 200, `BRIDGE` — `vmbr0`, `HOSTNAME` — `lxc-pve2netbox`, `ROOTFS_SIZE` — 2 GiB, `MEMORY` — 256 MiB.
+
+Examples:
+
+```bash
+CTID=201 BRIDGE=vmbr1 ./deploy-from-pve.sh
+./deploy-from-pve.sh --no-install   # create LXC only, skip app install
+```
 
 ---
 
 ## Configuration
 
-With systemd in LXC: file **`/etc/pve2netbox/env`** (format `KEY=value`, no `export`). Mode samples: **env.single-run**, **env.simple-mode**, **env.combined-mode** in this directory — copy into the container as `/etc/pve2netbox/env` or use as `.env` before deploy-from-pve.sh.
+Config file inside the container: **`/etc/pve2netbox/env`** (format `KEY=value`, no `export`).
 
-### Environment variables
+Mode samples in this directory:
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| **PVE_API_HOST** | yes | DNS or IP of Proxmox VE host |
-| **PVE_API_USER** | yes | PVE user (e.g. `netsync@pve`) |
-| **PVE_API_TOKEN** | yes | PVE API token name |
-| **PVE_API_SECRET** | yes | PVE API token secret |
-| **NB_API_URL** | yes | NetBox URL (e.g. `https://netbox.example.org`) |
-| **NB_API_TOKEN** | yes | NetBox API token |
-| **PVE_API_VERIFY_SSL** | no | PVE SSL verification (`true`/`false`, default `true`) |
-| **NB_CLUSTER_ID** | no | NetBox cluster ID |
-| **NB_API_DELAY_SECONDS** | no | Delay between NetBox requests, sec (default `0.2`) |
-| **NB_API_RETRY_TOTAL** | no | Retries on 502/503/429 (default `5`) |
-| **NB_API_RETRY_BACKOFF** | no | Backoff factor between retries (default `1.0`) |
-| **SYNC_INTERVAL_SECONDS** | no | Full sync interval, sec (modes 2 and 3) |
-| **QUICK_CHECK_INTERVAL_SECONDS** | no | Quick check interval, sec (mode 3, e.g. `60`) |
-| **SYNC_VMS** | no | Sync QEMU VMs (`true`/`false`, default `true`) |
-| **SYNC_LXC** | no | Sync LXC (`true`/`false`, default `true`) |
-| **SYNC_TAGS** | no | Sync Proxmox tags to NetBox VMs (`true`/`false`, default `true`) |
-| **VM_ROLE** | no | NetBox device role name or ID for VMs (e.g. `Virtual Machine`) |
-| **LXC_ROLE** | no | NetBox device role name or ID for LXC (e.g. `Container`) |
-| **DRY_RUN** | no | Check only, no changes (`true`/`false`) |
-| **ENABLE_CLEANUP** | no | Remove from NetBox VMs missing in PVE (`true`/`false`) |
-| **LOG_LEVEL** | no | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| **ENABLE_METRICS** | no | Enable Prometheus metrics (`true`/`false`) |
-| **METRICS_PORT** | no | Metrics port (default `9090`) |
+- `env.combined-mode` — **recommended** (quick check + full sync)
+- `env.simple-mode` — periodic full sync only
+- `env.single-run` — one-shot
 
-Full sample: [.env.example](../../.env.example).
+Variable reference: see [main README — Configuration](../../README.md#configuration) and [.env.example](../../.env.example).
 
+Network: from inside the LXC, both `PVE_API_HOST` and `NB_API_URL` must be reachable.
+
+---
+
+## Install into an existing LXC
+
+Enter the container with `pct enter <CTID>` (or `pct exec <CTID> -- ...`), then:
+
+```bash
+curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/install.sh | bash
+```
+
+The script installs dependencies, the package, and systemd units. On first run it seeds `/etc/pve2netbox/env` from `.env.example` (existing file is kept untouched).
+
+Edit config and enable:
+
+```bash
+nano /etc/pve2netbox/env
+systemctl enable --now pve2netbox
+```
+
+One-liner from the PVE host:
+
+```bash
+pct exec <CTID> -- bash -c 'curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/install.sh | bash'
+```
 
 ## Update
 
-From inside the container, run the install script (it will not overwrite existing `/etc/pve2netbox/env`), then restart the service:
+Re-run the install script inside the container — it will **not** overwrite your existing `/etc/pve2netbox/env`:
 
 ```bash
 curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/install.sh | bash
 systemctl restart pve2netbox
 ```
 
-## Install into an existing LXC
-
-Enter the container (`pct enter <CTID>`), then:
-
-**Option A** — one command (install from git repo + unit files and env from GitHub):
-
-```bash
-curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/install.sh | bash
-```
-
-**Option B** — from repo:
-
-```bash
-apt update && apt install -y git
-git clone https://github.com/aburdey08/pve2netbox.git && cd pve2netbox
-sudo ./contrib/lxc/install.sh
-```
+---
 
 ## Operation modes
 
-Same three modes (single-run, simple, combined). Variables in `/etc/pve2netbox/env`.
+Selected via variables in `/etc/pve2netbox/env`. Same three modes as everywhere else — see [main README — Operation modes](../../README.md#operation-modes).
 
-## Run
-
-- **Mode 1:** run `pve2netbox` manually or via cron.
-- **Mode 2 or 3:** [contrib/systemd/](../systemd/) — `systemctl enable --now pve2netbox`.
-
-## Check
-
-```bash
-systemctl status pve2netbox
-journalctl -u pve2netbox -f
-```
-
-## Network
-
-From LXC, PVE host/port (`PVE_API_HOST`) and NetBox URL (`NB_API_URL`) must be reachable.
-
----
-
-**Summary:** container already exists — install from inside (replace CTID):
-
-```bash
-pct exec 200 -- bash -c 'curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/install.sh | bash'
-```
-
-Then: edit `/etc/pve2netbox/env`, `systemctl enable --now pve2netbox`.
+Mode 1 (single-run): run `pve2netbox` manually or via cron. Modes 2 and 3: `systemctl enable --now pve2netbox`.

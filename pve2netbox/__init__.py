@@ -926,6 +926,7 @@ def _process_pve_virtual_machine_disks(
     """
     disk_prefixes = ('scsi', 'ide', 'sata', 'virtio', 'efidisk')
     skip_keys = ('scsihw', 'ide2', 'tpmstate0', 'tpm')
+    processed_disk_names = set()
     for (_config_key, _config_value) in _pve_virtual_machine_config.items():
         if _config_key in skip_keys or _config_key.startswith('tpm'):
             continue
@@ -947,6 +948,9 @@ def _process_pve_virtual_machine_disks(
             disk_size,
             _disk_definition.get('backup', '1') == '1',
         )
+        processed_disk_names.add(_disk_definition['name'])
+
+    _remove_stale_virtual_machine_disks(_nb_objects, _nb_virtual_machine, processed_disk_names)
 
     return _nb_objects
 
@@ -962,7 +966,7 @@ def _process_pve_virtual_machine_disk(
     """Create or update one virtual disk in NetBox (size and backup custom field)."""
     nb_disk = _nb_objects['disks'].get(_nb_virtual_machine.id, {}).get(_disk_name)
     if nb_disk is None:
-        _nb_api.virtualization.virtual_disks.create(
+        new_disk = _nb_api.virtualization.virtual_disks.create(
             name=_disk_name,
             size=_disk_size,
             virtual_machine=_nb_virtual_machine.id,
@@ -970,12 +974,37 @@ def _process_pve_virtual_machine_disk(
                 'backup': _has_backup,
             }
         )
+        if _nb_virtual_machine.id not in _nb_objects['disks']:
+            _nb_objects['disks'][_nb_virtual_machine.id] = {}
+        _nb_objects['disks'][_nb_virtual_machine.id][_disk_name] = new_disk
     else:
         nb_disk.size = _disk_size
         nb_disk.custom_fields['backup'] = _has_backup
         nb_disk.save()
 
     return _nb_objects
+
+
+def _remove_stale_virtual_machine_disks(
+        _nb_objects: dict,
+        _nb_virtual_machine: any,
+        _processed_disk_names: set,
+) -> None:
+    """Delete NetBox virtual disks for this VM that are no longer present in Proxmox config."""
+    existing_disks = _nb_objects['disks'].get(_nb_virtual_machine.id, {})
+    stale_disk_names = [
+        disk_name for disk_name in existing_disks
+        if disk_name not in _processed_disk_names
+    ]
+    for disk_name in stale_disk_names:
+        nb_disk = existing_disks[disk_name]
+        try:
+            nb_disk.delete()
+            logger.info(f'      Deleted stale disk from NetBox: {disk_name} (VM id {_nb_virtual_machine.id})')
+        except Exception as e:
+            logger.error(f'      Failed to delete stale disk {disk_name} for VM id {_nb_virtual_machine.id}: {e}')
+            continue
+        del existing_disks[disk_name]
 
 
 def _process_pve_lxc_network_interfaces(
@@ -1015,6 +1044,7 @@ def _process_pve_lxc_disks(
         _nb_virtual_machine: any,
 ) -> dict:
     """Sync LXC disks: rootfs (root) and mp0, mp1, ... (mount points)."""
+    processed_disk_names = set()
     if 'rootfs' in _pve_container_config:
         _disk_definition = _parse_pve_disk_definition(_pve_container_config['rootfs'])
         if 'size' in _disk_definition and 'name' in _disk_definition:
@@ -1028,6 +1058,7 @@ def _process_pve_lxc_disks(
                     disk_size,
                     _disk_definition.get('backup', '1') == '1',
                 )
+                processed_disk_names.add(_disk_definition['name'])
     for (_config_key, _config_value) in _pve_container_config.items():
         if not _config_key.startswith('mp'):
             continue
@@ -1044,6 +1075,9 @@ def _process_pve_lxc_disks(
                     disk_size,
                     _disk_definition.get('backup', '1') == '1',
                 )
+                processed_disk_names.add(_disk_definition['name'])
+
+    _remove_stale_virtual_machine_disks(_nb_objects, _nb_virtual_machine, processed_disk_names)
 
     return _nb_objects
 

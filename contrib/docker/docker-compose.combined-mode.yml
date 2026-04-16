@@ -4,7 +4,7 @@
 
 services:
   pve2netbox:
-    image: aburdey/pve2netbox:1.0.4
+    image: aburdey/pve2netbox:1.0.5
     environment:
       # PVE API (required — replace with your values)
       - PVE_API_HOST=10.10.0.10
