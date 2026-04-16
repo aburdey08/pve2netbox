@@ -1,5 +1,11 @@
 # pve2netbox
 
+## [1.0.5] - 2026-04-16
+
+### Fixed
+
+- **Stale VM disks cleanup**: when a disk is moved to another Proxmox storage, its path (NetBox disk `name`) changes and a new entry was previously added without removing the old one. The sync now tracks disks seen in the current Proxmox config and deletes obsolete `VirtualDisk` records from NetBox for both QEMU VMs and LXC containers.
+
 ## [1.0.4] - 2026-03-21
 
 ### Added

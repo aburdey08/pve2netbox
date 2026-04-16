@@ -1,74 +1,82 @@
 # Systemd: pve2netbox
 
-Unit files for running on host or in LXC (without Docker). Operation modes are the same as in the [main README](../../README.md#operation-modes-shared-by-docker-lxc-systemd).
+Unit files for running pve2netbox as a system service on a host or inside an LXC — without Docker.
 
-## Configuration
+> **Note:** if you're installing into an LXC, [contrib/lxc/install.sh](../lxc/install.sh) does all of this for you (installs deps + package + these units). This page is for bare-host installs or fully manual setups.
 
-- Directory: `/etc/pve2netbox/`
-- Variables file: `/etc/pve2netbox/env` — format `KEY=value`, no `export`. Mode samples: **env.single-run**, **env.simple-mode**, **env.combined-mode** in this directory (copy: `sudo cp env.<mode> /etc/pve2netbox/env`). Or use [.env.example](../../.env.example) as template.
+---
+
+## Quick start
+
+### 1. Install the package
+
+From the repo root (Python 3.8+, pip):
+
+```bash
+sudo pip3 install .
+```
+
+Or install directly from GitHub:
+
+```bash
+sudo pip3 install git+https://github.com/aburdey08/pve2netbox.git
+```
+
+### 2. Create the config
+
+Pick a mode sample from this directory (`env.combined-mode` — **recommended**) and drop it into `/etc/pve2netbox/env`:
 
 ```bash
 sudo mkdir -p /etc/pve2netbox
-sudo cp env.simple-mode /etc/pve2netbox/env   # or env.single-run / env.combined-mode
-sudo nano /etc/pve2netbox/env
+sudo cp env.combined-mode /etc/pve2netbox/env   # or env.simple-mode / env.single-run
+sudo chmod 600 /etc/pve2netbox/env
+sudo $EDITOR /etc/pve2netbox/env                # fill in PVE_API_* and NB_API_*
 ```
 
-Install unit files:
+Format: `KEY=value`, no `export`.
+
+### 3. Install unit files and start
 
 ```bash
 sudo cp pve2netbox.service /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable --now pve2netbox
 ```
 
-### Environment variables
+### 4. Check
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| **PVE_API_HOST** | yes | DNS or IP of Proxmox VE host |
-| **PVE_API_USER** | yes | PVE user (e.g. `netsync@pve`) |
-| **PVE_API_TOKEN** | yes | PVE API token name |
-| **PVE_API_SECRET** | yes | PVE API token secret |
-| **NB_API_URL** | yes | NetBox URL (e.g. `https://netbox.example.org`) |
-| **NB_API_TOKEN** | yes | NetBox API token |
-| **PVE_API_VERIFY_SSL** | no | PVE SSL verification (`true`/`false`, default `true`) |
-| **NB_CLUSTER_ID** | no | NetBox cluster ID |
-| **NB_API_DELAY_SECONDS** | no | Delay between NetBox requests, sec (default `0.2`) |
-| **NB_API_RETRY_TOTAL** | no | Retries on 502/503/429 (default `5`) |
-| **NB_API_RETRY_BACKOFF** | no | Backoff factor between retries (default `1.0`) |
-| **SYNC_INTERVAL_SECONDS** | no | Full sync interval, sec (modes 2 and 3) |
-| **QUICK_CHECK_INTERVAL_SECONDS** | no | Quick check interval, sec (mode 3, e.g. `60`) |
-| **SYNC_VMS** | no | Sync QEMU VMs (`true`/`false`, default `true`) |
-| **SYNC_LXC** | no | Sync LXC (`true`/`false`, default `true`) |
-| **SYNC_TAGS** | no | Sync Proxmox tags to NetBox VMs (`true`/`false`, default `true`) |
-| **VM_ROLE** | no | NetBox device role name or ID for VMs (e.g. `Virtual Machine`) |
-| **LXC_ROLE** | no | NetBox device role name or ID for LXC (e.g. `Container`) |
-| **DRY_RUN** | no | Check only, no changes (`true`/`false`) |
-| **ENABLE_CLEANUP** | no | Remove from NetBox VMs missing in PVE (`true`/`false`) |
-| **LOG_LEVEL** | no | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-| **ENABLE_METRICS** | no | Enable Prometheus metrics (`true`/`false`) |
-| **METRICS_PORT** | no | Metrics port (default `9090`) |
+```bash
+sudo systemctl status pve2netbox
+sudo journalctl -u pve2netbox -f
+```
 
-Full sample: [.env.example](../../.env.example).
+---
 
-## Operation modes
+## Configuration
 
-| Mode | How to run |
-|------|------------|
-| **1. Single-run** | Run manually: `python3 -m pve2netbox` or `pve2netbox` (env from file or export). Or cron / systemd timer (see option B below). |
-| **2. Simple** | Long-running service: set only `SYNC_INTERVAL_SECONDS` in `env`. `systemctl enable --now pve2netbox`. |
-| **3. Combined** | In `env` set `QUICK_CHECK_INTERVAL_SECONDS` and optionally `SYNC_INTERVAL_SECONDS`. `systemctl enable --now pve2netbox`. |
+Variables live in `/etc/pve2netbox/env`.
 
-## Run
+**Required:** `PVE_API_HOST`, `PVE_API_USER`, `PVE_API_TOKEN`, `PVE_API_SECRET`, `NB_API_URL`, `NB_API_TOKEN`.
 
-**Option A — long-running service (modes 2 and 3):**
+Full variable reference: [main README — Configuration](../../README.md#configuration) and [.env.example](../../.env.example).
+
+Mode is selected by interval variables — see [main README — Operation modes](../../README.md#operation-modes).
+
+---
+
+## Run options
+
+### Long-running service (Simple / Combined mode) — recommended
+
+One process, keeps running; systemd restarts it on failure after 60s.
 
 ```bash
 sudo systemctl enable --now pve2netbox
 ```
 
-Service runs continuously; restart on failure after 60s.
+### On a timer (Single-run on schedule)
 
-**Option B — on timer (mode 2 “on schedule”):** one sync per run, timer every 5 minutes.
+One-shot per trigger, timer fires every 5 minutes:
 
 ```bash
 sudo cp pve2netbox-oneshot.service pve2netbox.timer /etc/systemd/system/
@@ -76,11 +84,12 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now pve2netbox.timer
 ```
 
-Timer interval: edit `OnUnitActiveSec=5min` in `pve2netbox.timer`.
+Change the interval by editing `OnUnitActiveSec=5min` in `pve2netbox.timer`.
 
-## Check
+### Manual / cron (Single-run)
 
 ```bash
-sudo systemctl status pve2netbox
-journalctl -u pve2netbox -f
+pve2netbox
 ```
+
+Loads env from `/etc/pve2netbox/env` is **not** automatic in this mode — either `export` the variables or use `set -a; source /etc/pve2netbox/env; set +a; pve2netbox`.
