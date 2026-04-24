@@ -15,7 +15,7 @@ import urllib3
 from proxmoxer import ProxmoxAPI, ResourceException
 from urllib3.util.retry import Retry
 
-from .config import Config, load_config
+from .config import Config, TRANSIENT_PVE_LOCKS, load_config
 from .logger import logger, log_section
 from .metrics import metrics
 from .utils import (
@@ -285,6 +285,17 @@ def _ensure_nb_tag(tag_name: str, _nb_api: pynetbox.api, _nb_objects: dict) -> N
     _nb_objects['tags'][_nb_tag.name] = _nb_tag
 
 
+def _is_pve_entity_transiently_locked(_pve_entity: dict) -> bool:
+    """
+    Return True if PVE reports a transient ``lock`` that can briefly flip ``status``
+    (e.g. ``backup`` temporarily starts a helper QEMU for an offline VM) and the
+    IGNORE_STATUS_WHEN_LOCKED feature is enabled.
+    """
+    if os.getenv('IGNORE_STATUS_WHEN_LOCKED', 'true').lower() != 'true':
+        return False
+    return _pve_entity.get('lock') in TRANSIENT_PVE_LOCKS
+
+
 def _get_role_id(_nb_objects: dict, role_name_or_id: Optional[str]) -> Optional[int]:
     """Resolve device role ID by name or ID (e.g. from VM_ROLE/LXC_ROLE env)."""
     if not role_name_or_id:
@@ -363,6 +374,7 @@ def _process_pve_lxc_container(
     pve_container_config = _pve_api.nodes(_pve_node_name).lxc(_pve_container['vmid']).config.get()
     lxc_role_id = _get_role_id(_nb_objects, os.getenv('LXC_ROLE'))
     vm_name = pve_container_config.get('hostname', _pve_container['name'])
+    is_locked = _is_pve_entity_transiently_locked(_pve_container)
     nb_virtual_machine = _get_nb_vm_for_sync(_nb_api, _nb_objects, _pve_container['vmid'], vm_name)
     if nb_virtual_machine is None:
         create_params = {
@@ -373,7 +385,10 @@ def _process_pve_lxc_container(
             'device': _nb_device.id,
             'vcpus': pve_container_config.get('cores', 1),
             'memory': int(pve_container_config.get('memory', 512)),
-            'status': 'active' if _pve_container['status'] == 'running' else 'offline',
+            # While locked (e.g. backup) PVE status can flip; fall back to 'offline' for
+            # creation so we don't persist a transient 'active'.
+            'status': 'offline' if is_locked
+                      else ('active' if _pve_container['status'] == 'running' else 'offline'),
             'tags': list(map(lambda _pve_tag_name: _nb_objects['tags'][_pve_tag_name].id, _pve_tags)),
             'custom_fields': {
                 'autostart': pve_container_config.get('onboot') == 1,
@@ -394,7 +409,13 @@ def _process_pve_lxc_container(
         nb_virtual_machine.device = _nb_device.id
         nb_virtual_machine.vcpus = pve_container_config.get('cores', 1)
         nb_virtual_machine.memory = int(pve_container_config.get('memory', 512))
-        nb_virtual_machine.status = 'active' if _pve_container['status'] == 'running' else 'offline'
+        if is_locked:
+            logger.debug(
+                f'      LXC {_pve_container["vmid"]} is locked ({_pve_container.get("lock")}); '
+                f'keeping existing NetBox status'
+            )
+        else:
+            nb_virtual_machine.status = 'active' if _pve_container['status'] == 'running' else 'offline'
         nb_virtual_machine.tags = list(map(lambda _pve_tag_name: _nb_objects['tags'][_pve_tag_name].id, _pve_tags))
         if lxc_role_id:
             nb_virtual_machine.role = lxc_role_id
@@ -486,6 +507,7 @@ def _process_pve_virtual_machine(
         logger.debug(f'      Total agent interfaces found: {len(agent_data_by_mac)} (will match with Proxmox config by MAC)')
     vm_role_id = _get_role_id(_nb_objects, os.getenv('VM_ROLE'))
     vm_name = _pve_virtual_machine['name']
+    is_locked = _is_pve_entity_transiently_locked(_pve_virtual_machine)
     nb_virtual_machine = _get_nb_vm_for_sync(_nb_api, _nb_objects, _pve_virtual_machine['vmid'], vm_name)
     if nb_virtual_machine is None:
         create_params = {
@@ -496,7 +518,10 @@ def _process_pve_virtual_machine(
             'device': _nb_device.id,
             'vcpus': _get_virtual_machine_vcpus(pve_virtual_machine_config),
             'memory': int(pve_virtual_machine_config['memory']),
-            'status': 'active' if _pve_virtual_machine['status'] == 'running' else 'offline',
+            # While locked (e.g. backup) PVE status can flip; fall back to 'offline' for
+            # creation so we don't persist a transient 'active'.
+            'status': 'offline' if is_locked
+                      else ('active' if _pve_virtual_machine['status'] == 'running' else 'offline'),
             'tags': list(map(lambda _pve_tag_name: _nb_objects['tags'][_pve_tag_name].id, _pve_tags)),
             'custom_fields': {
                 'autostart': pve_virtual_machine_config.get('onboot') == 1,
@@ -517,7 +542,13 @@ def _process_pve_virtual_machine(
         nb_virtual_machine.device = _nb_device.id
         nb_virtual_machine.vcpus = _get_virtual_machine_vcpus(pve_virtual_machine_config)
         nb_virtual_machine.memory = int(pve_virtual_machine_config['memory'])
-        nb_virtual_machine.status = 'active' if _pve_virtual_machine['status'] == 'running' else 'offline'
+        if is_locked:
+            logger.debug(
+                f'      VM {_pve_virtual_machine["vmid"]} is locked '
+                f'({_pve_virtual_machine.get("lock")}); keeping existing NetBox status'
+            )
+        else:
+            nb_virtual_machine.status = 'active' if _pve_virtual_machine['status'] == 'running' else 'offline'
         nb_virtual_machine.tags = list(map(lambda _pve_tag_name: _nb_objects['tags'][_pve_tag_name].id, _pve_tags))
         if vm_role_id:
             nb_virtual_machine.role = vm_role_id
@@ -1144,6 +1175,16 @@ def quick_check_changes(_pve_api: ProxmoxAPI, _last_state: dict) -> tuple[list[i
     current_state = {}
     sync_vms = os.getenv('SYNC_VMS', 'true').lower() == 'true'
     sync_lxc = os.getenv('SYNC_LXC', 'true').lower() == 'true'
+    ignore_locked = os.getenv('IGNORE_STATUS_WHEN_LOCKED', 'true').lower() == 'true'
+
+    def _resolve_status(entity: dict, prev: dict) -> str:
+        """Reuse last-known status while PVE holds a transient lock (e.g. backup)."""
+        if ignore_locked and entity.get('lock') in TRANSIENT_PVE_LOCKS:
+            prev_status = prev.get('status') if isinstance(prev, dict) else None
+            if prev_status is not None:
+                return prev_status
+        return entity['status']
+
     for pve_node in _pve_api.nodes.get():
         node_name = pve_node['node']
         if sync_vms:
@@ -1151,7 +1192,7 @@ def quick_check_changes(_pve_api: ProxmoxAPI, _last_state: dict) -> tuple[list[i
                 for vm in _pve_api.nodes(node_name).qemu.get():
                     current_state[vm['vmid']] = {
                         'type': 'qemu',
-                        'status': vm['status'],
+                        'status': _resolve_status(vm, _last_state.get(vm['vmid'], {})),
                         'name': vm['name'],
                         'node': node_name,
                         'maxmem': vm.get('maxmem', 0),
@@ -1164,7 +1205,7 @@ def quick_check_changes(_pve_api: ProxmoxAPI, _last_state: dict) -> tuple[list[i
                 for ct in _pve_api.nodes(node_name).lxc.get():
                     current_state[ct['vmid']] = {
                         'type': 'lxc',
-                        'status': ct['status'],
+                        'status': _resolve_status(ct, _last_state.get(ct['vmid'], {})),
                         'name': ct['name'],
                         'node': node_name,
                         'maxmem': ct.get('maxmem', 0),

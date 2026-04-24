@@ -40,6 +40,7 @@ class Config:
     enable_cleanup: bool
     enable_metrics: bool
     metrics_port: int
+    ignore_status_when_locked: bool
 
 
 def load_config() -> Config:
@@ -108,6 +109,7 @@ def load_config() -> Config:
             enable_cleanup=os.getenv('ENABLE_CLEANUP', 'false').lower() == 'true',
             enable_metrics=os.getenv('ENABLE_METRICS', 'false').lower() == 'true',
             metrics_port=int(os.getenv('METRICS_PORT', '9090')),
+            ignore_status_when_locked=os.getenv('IGNORE_STATUS_WHEN_LOCKED', 'true').lower() == 'true',
         )
     except (ValueError, TypeError) as e:
         print(f'Configuration parsing error: {e}', file=sys.stderr)
@@ -121,3 +123,9 @@ ROLE_COLORS = {
     'lxc': '4caf50',
 }
 """Default hex color codes for device roles: 'vm' (blue) for QEMU VMs, 'lxc' (green) for LXC."""
+
+
+TRANSIENT_PVE_LOCKS = frozenset({'backup', 'snapshot', 'migrate', 'clone', 'rollback'})
+"""PVE ``lock`` values that can cause transient ``status`` flips (e.g. backup briefly
+starts a helper QEMU for a stopped VM). While locked, ``status`` must not overwrite
+the value stored in NetBox to avoid changelog noise."""

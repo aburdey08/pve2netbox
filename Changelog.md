@@ -1,5 +1,11 @@
 # pve2netbox
 
+## [Unreleased]
+
+### Fixed
+
+- **Backup-induced changelog noise**: during `vzdump` of a stopped VM, Proxmox briefly reports `status: running` (a helper QEMU is started for disk access), which previously produced `offline → active → offline` entries in the NetBox changelog on every backup. Status is now preserved unchanged while PVE holds a transient `lock` (`backup`, `snapshot`, `migrate`, `clone`, `rollback`); the same condition also prevents quick-check from flagging the VM as "changed". Controlled by new env var **`IGNORE_STATUS_WHEN_LOCKED`** (default `true`).
+
 ## [1.0.5] - 2026-04-16
 
 ### Fixed

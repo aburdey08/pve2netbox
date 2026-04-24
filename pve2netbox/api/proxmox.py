@@ -3,7 +3,7 @@
 from typing import Dict, List, Tuple
 from proxmoxer import ProxmoxAPI
 
-from ..config import Config
+from ..config import Config, TRANSIENT_PVE_LOCKS
 from ..logger import logger
 
 
@@ -25,6 +25,19 @@ def quick_check_changes(pve_api: ProxmoxAPI, last_state: Dict, config: Config) -
     returns (list of changed vmid, current_state).
     """
     current_state = {}
+
+    def _resolve_status(entity: dict, prev: Dict) -> str:
+        """
+        Return ``entity['status']`` unless PVE reports a transient lock (e.g. ``backup``)
+        that can briefly flip status; in that case reuse the previously observed status
+        to avoid triggering a spurious "changed" detection.
+        """
+        if config.ignore_status_when_locked and entity.get('lock') in TRANSIENT_PVE_LOCKS:
+            prev_status = prev.get('status') if isinstance(prev, dict) else None
+            if prev_status is not None:
+                return prev_status
+        return entity['status']
+
     for pve_node in pve_api.nodes.get():
         node_name = pve_node['node']
         if config.sync_vms:
@@ -32,7 +45,7 @@ def quick_check_changes(pve_api: ProxmoxAPI, last_state: Dict, config: Config) -
                 for vm in pve_api.nodes(node_name).qemu.get():
                     current_state[vm['vmid']] = {
                         'type': 'qemu',
-                        'status': vm['status'],
+                        'status': _resolve_status(vm, last_state.get(vm['vmid'], {})),
                         'name': vm['name'],
                         'node': node_name,
                         'maxmem': vm.get('maxmem', 0),
@@ -45,7 +58,7 @@ def quick_check_changes(pve_api: ProxmoxAPI, last_state: Dict, config: Config) -
                 for ct in pve_api.nodes(node_name).lxc.get():
                     current_state[ct['vmid']] = {
                         'type': 'lxc',
-                        'status': ct['status'],
+                        'status': _resolve_status(ct, last_state.get(ct['vmid'], {})),
                         'name': ct['name'],
                         'node': node_name,
                         'maxmem': ct.get('maxmem', 0),
