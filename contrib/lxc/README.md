@@ -31,7 +31,7 @@ curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/l
 chmod +x deploy-from-pve.sh
 
 # 2. Fill in PVE_API_* and NB_API_* in .env:
-$EDITOR .env
+nano .env
 
 # 3. Deploy — .env is picked up automatically:
 ./deploy-from-pve.sh

@@ -25,7 +25,7 @@ git clone https://github.com/aburdey08/pve2netbox.git
 cd pve2netbox
 
 # 1. Edit credentials (PVE_API_*, NB_API_*) in the compose file:
-$EDITOR contrib/docker/docker-compose.combined-mode.yml
+nano contrib/docker/docker-compose.combined-mode.yml
 
 # 2. Start:
 docker compose -f contrib/docker/docker-compose.combined-mode.yml up -d
@@ -47,7 +47,7 @@ curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/l
 chmod +x deploy-from-pve.sh
 
 # 2. Fill in PVE_API_* and NB_API_* in .env:
-$EDITOR .env
+nano .env
 
 # 3. Deploy (interactively asks for CTID, hostname, storage):
 ./deploy-from-pve.sh

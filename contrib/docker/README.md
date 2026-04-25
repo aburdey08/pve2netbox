@@ -13,7 +13,7 @@ git clone https://github.com/aburdey08/pve2netbox.git
 cd pve2netbox
 
 # 1. Edit credentials in the compose file (PVE_API_*, NB_API_*):
-$EDITOR contrib/docker/docker-compose.combined-mode.yml
+nano contrib/docker/docker-compose.combined-mode.yml
 
 # 2. Start:
 docker compose -f contrib/docker/docker-compose.combined-mode.yml up -d

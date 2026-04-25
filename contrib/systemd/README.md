@@ -30,7 +30,7 @@ Pick a mode sample from this directory (`env.combined-mode` — **recommended**)
 sudo mkdir -p /etc/pve2netbox
 sudo cp env.combined-mode /etc/pve2netbox/env   # or env.simple-mode / env.single-run
 sudo chmod 600 /etc/pve2netbox/env
-sudo $EDITOR /etc/pve2netbox/env                # fill in PVE_API_* and NB_API_*
+sudo nano /etc/pve2netbox/env                # fill in PVE_API_* and NB_API_*
 ```
 
 Format: `KEY=value`, no `export`.
