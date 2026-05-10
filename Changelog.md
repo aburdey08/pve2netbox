@@ -1,6 +1,12 @@
 # pve2netbox
 
-## [Unreleased]
+## [1.0.7] - 2026-05-10
+
+### Added
+
+- **`PRIMARY_SUBNETS`** — optional, comma- or whitespace-separated list of subnets used to pick `primary_ip4` / `primary_ip6` for each VM (e.g. `PRIMARY_SUBNETS=192.168.88.0/24, 2001:db8::/64`). Subnet order defines priority: for IPv4 and for IPv6 independently, the first subnet in the list that matches an IP reported by the QEMU guest agent wins. Within a subnet candidate IPs are sorted, so the result is deterministic regardless of the order Proxmox/agent returns interfaces. When the variable is unset/empty, pve2netbox does **not** touch `primary_ip4`/`primary_ip6` (see 1.0.7 below). Invalid subnet are logged and skipped.
+
+## [1.0.6] - 2026-04-24
 
 ### Fixed
 

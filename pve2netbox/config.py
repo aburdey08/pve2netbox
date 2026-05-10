@@ -1,9 +1,12 @@
 """Configuration management and validation for pve2netbox."""
 
+import ipaddress
 import os
 import sys
-from typing import Optional
-from dataclasses import dataclass
+from typing import Optional, Tuple, Union
+from dataclasses import dataclass, field
+
+IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
 
 @dataclass
@@ -41,6 +44,7 @@ class Config:
     enable_metrics: bool
     metrics_port: int
     ignore_status_when_locked: bool
+    primary_subnets: Tuple[IPNetwork, ...] = field(default_factory=tuple)
 
 
 def load_config() -> Config:
@@ -83,6 +87,8 @@ def load_config() -> Config:
             print(f'  - {error}', file=sys.stderr)
         sys.exit(1)
 
+    primary_subnets = _parse_primary_subnets(os.getenv('PRIMARY_SUBNETS'))
+
     try:
         config = Config(
             pve_api_host=pve_api_host,  # type: ignore
@@ -110,6 +116,7 @@ def load_config() -> Config:
             enable_metrics=os.getenv('ENABLE_METRICS', 'false').lower() == 'true',
             metrics_port=int(os.getenv('METRICS_PORT', '9090')),
             ignore_status_when_locked=os.getenv('IGNORE_STATUS_WHEN_LOCKED', 'true').lower() == 'true',
+            primary_subnets=primary_subnets,
         )
     except (ValueError, TypeError) as e:
         print(f'Configuration parsing error: {e}', file=sys.stderr)
@@ -129,3 +136,32 @@ TRANSIENT_PVE_LOCKS = frozenset({'backup', 'snapshot', 'migrate', 'clone', 'roll
 """PVE ``lock`` values that can cause transient ``status`` flips (e.g. backup briefly
 starts a helper QEMU for a stopped VM). While locked, ``status`` must not overwrite
 the value stored in NetBox to avoid changelog noise."""
+
+
+def _parse_primary_subnets(raw: Optional[str]) -> Tuple[IPNetwork, ...]:
+    """
+    Parse ``PRIMARY_SUBNETS`` env value into an ordered tuple of IP networks.
+
+    Accepts a comma- and/or whitespace-separated list (e.g.
+    ``"192.168.88.0/24, 2001:db8::/64"``). Each token is parsed with
+    ``ipaddress.ip_network(strict=False)``; invalid tokens print a warning to
+    stderr and are skipped. Order is preserved — it defines the priority used
+    when picking primary IPv4/IPv6 for a VM (first matching subnet wins).
+    """
+    if not raw:
+        return ()
+
+    subnets = []
+    for token in raw.replace(',', ' ').split():
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            subnets.append(ipaddress.ip_network(token, strict=False))
+        except ValueError as exc:
+            print(
+                f'Warning: ignoring invalid subnet in PRIMARY_SUBNETS: '
+                f'"{token}" ({exc})',
+                file=sys.stderr,
+            )
+    return tuple(subnets)

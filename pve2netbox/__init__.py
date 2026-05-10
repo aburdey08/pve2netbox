@@ -4,6 +4,7 @@
 pve2netbox: Synchronize Proxmox Virtual Environment (PVE) information to a NetBox instance.
 """
 
+import ipaddress
 import os
 import sys
 import time
@@ -626,7 +627,95 @@ def _process_pve_virtual_machine_network_interfaces(
             agent_data,
         )
     logger.info(f'      Synced {proxmox_interfaces_count} interface(s) from Proxmox config, {matched_interfaces_count} matched with guest agent')
+    _resolve_primary_ip_assignments(
+        _nb_objects,
+        _nb_virtual_machine,
+        _agent_data_by_mac,
+    )
     return _nb_objects
+
+
+def _resolve_primary_ip_assignments(
+        _nb_objects: dict,
+        _nb_virtual_machine: any,
+        _agent_data_by_mac: dict,
+) -> None:
+    """
+    Set ``primary_ip4``/``primary_ip6`` on a VM based on configured
+    ``PRIMARY_SUBNETS``. If no subnets are configured, do nothing — current
+    NetBox values (manual or already set) are left untouched.
+
+    Subnet order defines priority: for each subnet (in order) the first
+    matching IP from QEMU guest-agent data assigned in NetBox is picked.
+    Within a subnet candidate IPs are sorted, so the result is deterministic
+    regardless of the order Proxmox/agent returns interfaces.
+    """
+    primary_subnets = _config.primary_subnets if _config is not None else ()
+    if not primary_subnets:
+        return
+
+    candidates_v4 = []
+    candidates_v6 = []
+    for agent_data in _agent_data_by_mac.values():
+        for ip_info in agent_data.get('ip_addresses', []):
+            addr = ip_info.get('address')
+            prefix = ip_info.get('prefix')
+            if not addr or prefix is None:
+                continue
+            full_address = f'{addr}/{prefix}'
+            nb_ip = _nb_objects['ip_addresses'].get(full_address)
+            if nb_ip is None:
+                continue
+            try:
+                ip_obj = ipaddress.ip_interface(full_address).ip
+            except ValueError:
+                continue
+            entry = (ip_obj, nb_ip.id, full_address)
+            if ip_obj.version == 4:
+                candidates_v4.append(entry)
+            else:
+                candidates_v6.append(entry)
+
+    candidates_v4.sort(key=lambda item: item[0])
+    candidates_v6.sort(key=lambda item: item[0])
+
+    chosen_v4 = None
+    chosen_v6 = None
+    for subnet in primary_subnets:
+        if subnet.version == 4 and chosen_v4 is None:
+            for ip_obj, nb_ip_id, full_address in candidates_v4:
+                if ip_obj in subnet:
+                    chosen_v4 = (nb_ip_id, full_address, subnet)
+                    break
+        elif subnet.version == 6 and chosen_v6 is None:
+            for ip_obj, nb_ip_id, full_address in candidates_v6:
+                if ip_obj in subnet:
+                    chosen_v6 = (nb_ip_id, full_address, subnet)
+                    break
+        if chosen_v4 is not None and chosen_v6 is not None:
+            break
+
+    needs_save = False
+    if chosen_v4 is not None:
+        current = getattr(_nb_virtual_machine, 'primary_ip4', None)
+        current_id = current.id if current is not None else None
+        if current_id != chosen_v4[0]:
+            _nb_virtual_machine.primary_ip4 = chosen_v4[0]
+            needs_save = True
+            logger.info(
+                f'        ✓ Set primary IPv4: {chosen_v4[1]} (matched {chosen_v4[2]})'
+            )
+    if chosen_v6 is not None:
+        current = getattr(_nb_virtual_machine, 'primary_ip6', None)
+        current_id = current.id if current is not None else None
+        if current_id != chosen_v6[0]:
+            _nb_virtual_machine.primary_ip6 = chosen_v6[0]
+            needs_save = True
+            logger.info(
+                f'        ✓ Set primary IPv6: {chosen_v6[1]} (matched {chosen_v6[2]})'
+            )
+    if needs_save:
+        _nb_virtual_machine.save()
 
 
 def _process_pve_virtual_machine_network_interface(
@@ -924,10 +1013,6 @@ def _process_pve_virtual_machine_network_interface(
                 nb_ip_address.dns_name = ip_address_dns_name
                 nb_ip_address.save()
                 logger.debug(f'        ✓ Updated IP {_virtual_machine_full_address} on interface {_interface_name}')
-
-        _nb_virtual_machine.primary_ip4 = nb_ip_address.id
-        _nb_virtual_machine.save()
-        logger.info(f'        ✓ Set primary IPv4: {_virtual_machine_full_address}')
     else:
         logger.debug(f'        Interface {_interface_name}: no IPv4 address found from guest agent')
         if _interface_vlan_id is not None:

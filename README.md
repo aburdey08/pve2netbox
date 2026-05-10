@@ -87,6 +87,7 @@ Common optional variables:
 | `ENABLE_CLEANUP` | `false` | Delete from NetBox VMs missing in PVE (**use with care**) |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `ENABLE_METRICS` / `METRICS_PORT` | `false` / `9090` | Prometheus metrics on `/metrics` |
+| `PRIMARY_SUBNETS` | — | Comma/space-separated subnets used to pick `primary_ip4`/`primary_ip6` (first matching subnet wins, IPv4/IPv6 independent). Empty = leave `primary_ip*` untouched. Example: `192.168.88.0/24, 2001:db8::/64` |
 
 Full list and comments: [.env.example](.env.example).
 
