@@ -4,13 +4,41 @@ import ipaddress
 import os
 import re
 import sys
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 
 IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
 NODE_MISSING_POLICIES = ('skip', 'fail')
 """Allowed values of ``NODE_MISSING_POLICY``: skip the node, or abort the run."""
+
+LXC_IP_SOURCES = ('auto', 'config', 'runtime', 'none')
+"""Allowed values of ``LXC_IP_SOURCE``.
+
+``runtime`` reads the addresses a running container actually has
+(``/nodes/{node}/lxc/{vmid}/interfaces``, works with DHCP), ``config`` reads the
+static ``ip=``/``ip6=`` values from the container config, ``auto`` prefers
+runtime and falls back to config, and ``none`` restores the pre-1.1.0 behaviour
+of not syncing container IPs at all."""
+
+DESCRIPTION_TARGETS = ('comments', 'description')
+"""Allowed values of ``DESCRIPTION_TARGET``: the NetBox field that receives the
+Proxmox note. ``description`` is a short single-line field, hence the
+``comments`` default."""
+
+TEMPLATE_POLICIES = ('tag', 'skip', 'sync')
+"""Allowed values of ``TEMPLATE_POLICY``: tag templates, skip them entirely, or
+sync them like any other VM (the pre-1.1.0 behaviour)."""
+
+TEMPLATE_TAG_NAME = 'pve-template'
+"""NetBox tag applied to Proxmox templates when ``TEMPLATE_POLICY=tag``."""
+
+NB_DESCRIPTION_MAX_LENGTH = 200
+"""Length of NetBox's ``description`` field; longer notes are truncated."""
+
+NB_COMMENTS_MAX_LENGTH = 5000
+"""Self-imposed cap for ``comments``. The NetBox field is unbounded, but a
+runaway note should not turn every sync into a large write."""
 
 _ENV_KEY_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
@@ -27,6 +55,8 @@ class Config:
     Roles: vm_role, lxc_role (optional device role names).
     Feature flags: dry_run, enable_cleanup, enable_metrics, metrics_port,
     enable_health_endpoint, node_missing_policy.
+    Fields: lxc_ip_source, sync_description, description_target, sync_platform,
+    platform_map, pool_as_tenant, template_policy.
     """
     pve_api_host: str
     pve_api_user: str
@@ -55,6 +85,13 @@ class Config:
     nb_cluster_name: Optional[str] = None
     node_missing_policy: str = 'skip'
     enable_health_endpoint: bool = True
+    lxc_ip_source: str = 'auto'
+    sync_description: bool = True
+    description_target: str = 'comments'
+    sync_platform: bool = False
+    platform_map: Dict[str, str] = field(default_factory=dict)
+    pool_as_tenant: bool = False
+    template_policy: str = 'tag'
 
 
 def load_env_file(path: str, override: bool = False) -> int:
@@ -198,6 +235,26 @@ def load_config() -> Config:
             f'got "{node_missing_policy}"'
         )
 
+    lxc_ip_source = os.getenv('LXC_IP_SOURCE', 'auto').strip().lower()
+    if lxc_ip_source not in LXC_IP_SOURCES:
+        errors.append(
+            f'LXC_IP_SOURCE must be one of {", ".join(LXC_IP_SOURCES)}, got "{lxc_ip_source}"'
+        )
+
+    description_target = os.getenv('DESCRIPTION_TARGET', 'comments').strip().lower()
+    if description_target not in DESCRIPTION_TARGETS:
+        errors.append(
+            f'DESCRIPTION_TARGET must be one of {", ".join(DESCRIPTION_TARGETS)}, '
+            f'got "{description_target}"'
+        )
+
+    template_policy = os.getenv('TEMPLATE_POLICY', 'tag').strip().lower()
+    if template_policy not in TEMPLATE_POLICIES:
+        errors.append(
+            f'TEMPLATE_POLICY must be one of {", ".join(TEMPLATE_POLICIES)}, '
+            f'got "{template_policy}"'
+        )
+
     if errors:
         print('Configuration errors:', file=sys.stderr)
         for error in errors:
@@ -205,6 +262,8 @@ def load_config() -> Config:
         sys.exit(1)
 
     primary_subnets = _parse_primary_subnets(os.getenv('PRIMARY_SUBNETS'))
+    platform_map = dict(DEFAULT_PLATFORM_MAP)
+    platform_map.update(_parse_platform_map(os.getenv('PLATFORM_MAP')))
 
     try:
         config = Config(
@@ -237,6 +296,13 @@ def load_config() -> Config:
             nb_cluster_name=nb_cluster_name,
             node_missing_policy=node_missing_policy,
             enable_health_endpoint=_env_flag('ENABLE_HEALTH_ENDPOINT', True),
+            lxc_ip_source=lxc_ip_source,
+            sync_description=_env_flag('SYNC_DESCRIPTION', True),
+            description_target=description_target,
+            sync_platform=_env_flag('SYNC_PLATFORM', False),
+            platform_map=platform_map,
+            pool_as_tenant=_env_flag('POOL_AS_TENANT', False),
+            template_policy=template_policy,
         )
     except (ValueError, TypeError) as e:
         print(f'Configuration parsing error: {e}', file=sys.stderr)
@@ -260,6 +326,76 @@ the value stored in NetBox to avoid changelog noise."""
 
 PROXMOX_CLUSTER_TYPE = 'Proxmox VE'
 """NetBox cluster type created when a cluster has to be provisioned by name."""
+
+
+DEFAULT_PLATFORM_MAP = {
+    # QEMU ostype values are coarse — they describe the guest family, not the distro.
+    'l24': 'Linux',
+    'l26': 'Linux',
+    'solaris': 'Solaris',
+    'wxp': 'Windows XP',
+    'w2k': 'Windows 2000',
+    'w2k3': 'Windows Server 2003',
+    'w2k8': 'Windows Server 2008',
+    'wvista': 'Windows Vista',
+    'win7': 'Windows 7',
+    'win8': 'Windows 8',
+    'win10': 'Windows 10',
+    'win11': 'Windows 11',
+    # LXC ostype comes from the template and names the distribution exactly.
+    'alpine': 'Alpine Linux',
+    'archlinux': 'Arch Linux',
+    'almalinux': 'AlmaLinux',
+    'centos': 'CentOS',
+    'debian': 'Debian',
+    'devuan': 'Devuan',
+    'fedora': 'Fedora',
+    'gentoo': 'Gentoo',
+    'nixos': 'NixOS',
+    'opensuse': 'openSUSE',
+    'rocky': 'Rocky Linux',
+    'ubuntu': 'Ubuntu',
+}
+"""Default ``ostype`` → NetBox platform name mapping used by ``SYNC_PLATFORM``.
+
+``other`` and ``unmanaged`` are deliberately absent: they carry no information,
+and inventing a platform for them would be worse than leaving the field alone.
+Override or extend through ``PLATFORM_MAP``."""
+
+
+def _parse_platform_map(raw: Optional[str]) -> Dict[str, str]:
+    """
+    Parse ``PLATFORM_MAP`` (``l26=Linux,win11=Windows 11``) into a dict.
+
+    Keys are lowercased ``ostype`` values; entries override
+    ``DEFAULT_PLATFORM_MAP``. An empty value (``l26=``) suppresses the default
+    mapping for that ``ostype``. Malformed entries print a warning and are
+    skipped rather than aborting the run.
+    """
+    if not raw:
+        return {}
+
+    mapping: Dict[str, str] = {}
+    for token in raw.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        if '=' not in token:
+            print(
+                f'Warning: ignoring invalid entry in PLATFORM_MAP: "{token}" '
+                f'(expected ostype=Platform Name)',
+                file=sys.stderr,
+            )
+            continue
+        ostype, platform_name = token.split('=', 1)
+        ostype = ostype.strip().lower()
+        platform_name = platform_name.strip()
+        if not ostype:
+            print(f'Warning: ignoring PLATFORM_MAP entry without ostype: "{token}"',
+                  file=sys.stderr)
+            continue
+        mapping[ostype] = platform_name
+    return mapping
 
 
 def _parse_primary_subnets(raw: Optional[str]) -> Tuple[IPNetwork, ...]:
@@ -329,4 +465,9 @@ def describe_config(config: Config) -> List[Tuple[str, Any]]:
         ('Dry run', config.dry_run),
         ('Cleanup', config.enable_cleanup),
         ('Node missing policy', config.node_missing_policy),
+        ('LXC IP source', config.lxc_ip_source),
+        ('Sync description', f'{config.sync_description} → {config.description_target}'),
+        ('Sync platform', config.sync_platform),
+        ('Pool as tenant', config.pool_as_tenant),
+        ('Template policy', config.template_policy),
     ]

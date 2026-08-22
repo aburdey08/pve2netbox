@@ -2,7 +2,7 @@
 
 [![Docker Hub](https://img.shields.io/badge/Docker%20Hub-0db7ed?logo=docker&logoColor=white)](https://hub.docker.com/r/aburdey/pve2netbox)
 
-Sync Proxmox VE (PVE) inventory to NetBox: QEMU VMs and LXC containers, their disks, network interfaces, IPs (via QEMU Guest Agent) and tags.
+Sync Proxmox VE (PVE) inventory to NetBox: QEMU VMs and LXC containers, their disks, network interfaces, IP addresses and tags.
 
 Based on [creekorful/netbox-pve-sync](https://github.com/creekorful/netbox-pve-sync).
 
@@ -98,6 +98,13 @@ Common optional variables:
 | `ENABLE_METRICS` / `METRICS_PORT` | `false` / `9090` | Prometheus metrics on `/metrics` |
 | `ENABLE_HEALTH_ENDPOINT` | `true` | `/healthz` and `/readyz` on `METRICS_PORT` |
 | `PRIMARY_SUBNETS` | — | Comma/space-separated subnets used to pick `primary_ip4`/`primary_ip6` (first matching subnet wins, IPv4/IPv6 independent). Empty = leave `primary_ip*` untouched. Example: `192.168.88.0/24, 2001:db8::/64` |
+| `LXC_IP_SOURCE` | `auto` | Where container IPs come from: `auto` (running container, falling back to static config), `runtime`, `config`, `none` |
+| `SYNC_DESCRIPTION` | `true` | Copy the PVE description (Notes) into NetBox |
+| `DESCRIPTION_TARGET` | `comments` | Target field: `comments` (multi-line) or `description` (200 chars) |
+| `SYNC_PLATFORM` | `false` | Map `ostype` to a NetBox platform (created if missing) |
+| `PLATFORM_MAP` | — | Override the built-in mapping: `l26=Linux,win11=Windows 11` |
+| `POOL_AS_TENANT` | `false` | Also map the Proxmox pool to a NetBox tenant (created if missing) |
+| `TEMPLATE_POLICY` | `tag` | Templates: `tag` (sync + tag `pve-template`), `skip`, `sync` |
 
 Full list and comments: [.env.example](.env.example).
 
@@ -138,9 +145,24 @@ Hits the Proxmox VE API, reads VMs/LXC, and creates/updates NetBox objects accor
 **Supported:**
 
 - **QEMU VMs** — disks (SCSI/SATA/VirtIO/IDE/EFI), NICs with VLAN and MTU, IPs via QEMU Guest Agent (interfaces matched by MAC).
-- **LXC containers** — rootfs and mount points (`mp0`, `mp1`…), NICs with MTU. IP sync not available (no guest agent).
+- **LXC containers** — rootfs and mount points (`mp0`, `mp1`…), NICs with MTU, and IP addresses (see below).
+- **Both** — Proxmox notes, `ostype` as platform, pool as tenant, and template marking (all except notes are opt-in).
 
 **QEMU Guest Agent** (when `agent=1` and VM is running): real OS interface names (e.g. `eth0`) instead of `net0`, MAC-based matching, IPv4/IPv6 assignment to NetBox interfaces.
+
+**LXC IP addresses** (since 1.1.0) come from two sources, selected with `LXC_IP_SOURCE`:
+
+| Source | Where from | Works for |
+|--------|-----------|-----------|
+| runtime | `GET /nodes/{node}/lxc/{vmid}/interfaces` | Running containers, **including DHCP** |
+| config | `ip=` / `ip6=` in `net0`, `net1`… | Static addresses, container running or not |
+
+`auto` (default) prefers runtime and falls back to the static config — per interface, so a container
+that reports only some of its NICs still gets the rest from its config. When the endpoint is
+unavailable (older PVE, token without `VM.Audit`) the run logs a warning and uses the static
+addresses instead of failing. Loopback and link-local (`fe80::`) addresses are never written to
+NetBox. Because the data reaches NetBox through the same path as guest-agent data,
+`PRIMARY_SUBNETS` sets `primary_ip4`/`primary_ip6` for containers too.
 
 **Auto-created in NetBox on first run:**
 
@@ -152,6 +174,9 @@ Hits the Proxmox VE API, reads VMs/LXC, and creates/updates NetBox objects accor
 | Custom field | `backup` | Boolean | Virtual Disk |
 | Custom field | `dns_name` | Text | Prefix |
 | Device role | from `VM_ROLE` / `LXC_ROLE` | — | `vm_role=true` |
+| Tag | `pve-template` | — | `TEMPLATE_POLICY=tag` |
+| Platform | from `ostype` | — | `SYNC_PLATFORM=true` |
+| Tenant | from the Proxmox pool name | — | `POOL_AS_TENANT=true` |
 
 ---
 
