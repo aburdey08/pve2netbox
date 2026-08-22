@@ -41,9 +41,12 @@ That's it. More details and other modes: [contrib/docker/](contrib/docker/).
 Run **on a Proxmox node as root** — creates a Debian 12 LXC and installs everything. If a **`.env`** file is placed next to the script, it is copied into the container as `/etc/pve2netbox/env` automatically — the service is fully configured right after deploy.
 
 ```bash
+# Testing a specific branch instead of master? export REPO_BRANCH=your-branch first.
+export REPO_BRANCH="${REPO_BRANCH:-master}"
+
 # 1. Get the Combined-mode sample and the deploy script:
-curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/env.combined-mode -o .env
-curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/deploy-from-pve.sh -o deploy-from-pve.sh
+curl -sL "https://raw.githubusercontent.com/aburdey08/pve2netbox/$REPO_BRANCH/contrib/lxc/env.combined-mode" -o .env
+curl -sL "https://raw.githubusercontent.com/aburdey08/pve2netbox/$REPO_BRANCH/contrib/lxc/deploy-from-pve.sh" -o deploy-from-pve.sh
 chmod +x deploy-from-pve.sh
 
 # 2. Fill in PVE_API_* and NB_API_* in .env:

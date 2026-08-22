@@ -7,7 +7,8 @@ set -e
 
 [[ "$(id -u)" -eq 0 ]] || { echo "Run this script as root (sudo)."; exit 1; }
 
-REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/aburdey08/pve2netbox/master}"
+REPO_BRANCH="${REPO_BRANCH:-master}"
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/aburdey08/pve2netbox/$REPO_BRANCH}"
 REPO_GIT="${REPO_GIT:-https://github.com/aburdey08/pve2netbox.git}"
 INSTALL_DIR=/etc/pve2netbox
 SYSTEMD_DIR=/etc/systemd/system
@@ -38,7 +39,7 @@ if [[ -n "$SCRIPT_DIR" ]]; then
 else
   echo "[*] Installing from repo: $REPO_GIT"
   clone_dir=$(mktemp -d)
-  git clone --depth 1 "$REPO_GIT" "$clone_dir"
+  git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_GIT" "$clone_dir"
   pip3 install --break-system-packages "$clone_dir" 2>/dev/null || pip3 install "$clone_dir"
   rm -rf "$clone_dir"
 fi

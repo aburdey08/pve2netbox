@@ -20,6 +20,7 @@ Or install directly from GitHub:
 
 ```bash
 sudo pip3 install git+https://github.com/aburdey08/pve2netbox.git
+# testing a branch: sudo pip3 install git+https://github.com/aburdey08/pve2netbox.git@your-branch
 ```
 
 ### 2. Create the config
