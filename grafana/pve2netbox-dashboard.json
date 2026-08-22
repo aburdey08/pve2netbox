@@ -256,7 +256,7 @@
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "expr": "time() - pve2netbox_last_sync_timestamp_seconds",
+          "expr": "time() - pve2netbox_last_success_timestamp_seconds",
           "legendFormat": "Ago",
           "refId": "A"
         }

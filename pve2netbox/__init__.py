@@ -5,18 +5,19 @@ pve2netbox: Synchronize Proxmox Virtual Environment (PVE) information to a NetBo
 """
 
 import ipaddress
-import os
 import sys
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, List, Tuple, Any
 
 import pynetbox
 import requests
-import urllib3
 from proxmoxer import ProxmoxAPI, ResourceException
-from urllib3.util.retry import Retry
 
-from .config import Config, TRANSIENT_PVE_LOCKS, load_config
+from . import shutdown
+from .api.netbox import make_netbox_session, resolve_cluster
+from .api.proxmox import create_proxmox_api
+from .api.proxmox import quick_check_changes as _api_quick_check_changes
+from .config import Config, TRANSIENT_PVE_LOCKS, get_config, load_config, set_config
 from .logger import logger, log_section
 from .metrics import metrics
 from .utils import (
@@ -25,46 +26,35 @@ from .utils import (
     parse_pve_disk_size as _process_pve_disk_size,
     get_virtual_machine_vcpus as _get_virtual_machine_vcpus,
 )
+from .version import __version__
 
-_config: Optional[Config] = None
-"""Current configuration; set in main()."""
+__all__ = [
+    '__version__',
+    'main',
+    'quick_check_changes',
+    'sync_specific_vms',
+    'cleanup_stale_vms',
+]
 
 
-class _RateLimitRetryAdapter(requests.adapters.HTTPAdapter):
-    """HTTP adapter with optional delay before each request and retry on 502/503/429."""
+def _cfg() -> Config:
+    """
+    Configuration for the current process.
 
-    def __init__(self, delay_seconds: float = 0.0, retry: Optional[Retry] = None, *args, **kwargs):
-        super().__init__(*args, max_retries=retry, **kwargs)
-        self._delay_seconds = delay_seconds
-
-    def send(self, request, **kwargs):
-        if self._delay_seconds > 0:
-            time.sleep(self._delay_seconds)
-        return super().send(request, **kwargs)
+    Loaded once by the CLI; falls back to reading the environment on first use
+    so the package still works when imported as a library.
+    """
+    return get_config()
 
 
 def _make_netbox_session() -> requests.Session:
     """Create requests session with retry on 502/503/429 and optional delay between requests."""
-    delay = float(os.getenv('NB_API_DELAY_SECONDS', '0.2'))
-    retry_total = int(os.getenv('NB_API_RETRY_TOTAL', '5'))
-    retry_backoff = float(os.getenv('NB_API_RETRY_BACKOFF', '1.0'))
-
-    retries = Retry(
-        total=retry_total,
-        backoff_factor=retry_backoff,
-        status_forcelist=(502, 503, 429),
-        allowed_methods=('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'),
-    )
-    adapter = _RateLimitRetryAdapter(delay_seconds=delay, retry=retries)
-    session = requests.Session()
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    return session
+    return make_netbox_session(_cfg())
 
 
 def _provision_custom_fields(_nb_api: pynetbox.api) -> None:
     """Create required custom fields in NetBox if they do not exist."""
-    if _config and _config.dry_run:
+    if _cfg().dry_run:
         logger.info('[DRY RUN] Would provision custom fields')
         return
 
@@ -130,15 +120,15 @@ def _provision_custom_fields(_nb_api: pynetbox.api) -> None:
 
 def _provision_roles(_nb_api: pynetbox.api) -> None:
     """Create device roles in NetBox if specified in env (VM_ROLE, LXC_ROLE) and do not exist."""
-    vm_role_name = os.getenv('VM_ROLE')
-    lxc_role_name = os.getenv('LXC_ROLE')
+    vm_role_name = _cfg().vm_role
+    lxc_role_name = _cfg().lxc_role
     
     if not vm_role_name and not lxc_role_name:
         logger.info('Provisioning device roles...')
         logger.info('  No VM_ROLE or LXC_ROLE configured, skipping')
         return
     
-    if _config and _config.dry_run:
+    if _cfg().dry_run:
         logger.info('Provisioning device roles...')
         logger.info('[DRY RUN] Would provision device roles')
         return
@@ -292,7 +282,7 @@ def _is_pve_entity_transiently_locked(_pve_entity: dict) -> bool:
     (e.g. ``backup`` temporarily starts a helper QEMU for an offline VM) and the
     IGNORE_STATUS_WHEN_LOCKED feature is enabled.
     """
-    if os.getenv('IGNORE_STATUS_WHEN_LOCKED', 'true').lower() != 'true':
+    if not _cfg().ignore_status_when_locked:
         return False
     return _pve_entity.get('lock') in TRANSIENT_PVE_LOCKS
 
@@ -335,7 +325,7 @@ def _get_nb_vm_for_sync(
     if vm is not None:
         return vm
 
-    cluster_id = int(os.environ.get('NB_CLUSTER_ID', 1))
+    cluster_id = _cfg().nb_cluster_id
     vm = _nb_objects['virtual_machines_by_name_cluster'].get((vm_name, cluster_id))
     if vm is not None:
         return vm
@@ -373,7 +363,7 @@ def _process_pve_lxc_container(
     """
     _pve_node_name = _nb_device.name.lower()
     pve_container_config = _pve_api.nodes(_pve_node_name).lxc(_pve_container['vmid']).config.get()
-    lxc_role_id = _get_role_id(_nb_objects, os.getenv('LXC_ROLE'))
+    lxc_role_id = _get_role_id(_nb_objects, _cfg().lxc_role)
     vm_name = pve_container_config.get('hostname', _pve_container['name'])
     is_locked = _is_pve_entity_transiently_locked(_pve_container)
     nb_virtual_machine = _get_nb_vm_for_sync(_nb_api, _nb_objects, _pve_container['vmid'], vm_name)
@@ -382,7 +372,7 @@ def _process_pve_lxc_container(
             'serial': _pve_container['vmid'],
             'name': vm_name,
             'site': _nb_device.site.id,
-            'cluster': os.environ.get('NB_CLUSTER_ID', 1),
+            'cluster': _cfg().nb_cluster_id,
             'device': _nb_device.id,
             'vcpus': pve_container_config.get('cores', 1),
             'memory': int(pve_container_config.get('memory', 512)),
@@ -406,7 +396,7 @@ def _process_pve_lxc_container(
         nb_virtual_machine.serial = _pve_container['vmid']
         nb_virtual_machine.name = vm_name
         nb_virtual_machine.site = _nb_device.site.id
-        nb_virtual_machine.cluster = os.environ.get('NB_CLUSTER_ID', 1)
+        nb_virtual_machine.cluster = _cfg().nb_cluster_id
         nb_virtual_machine.device = _nb_device.id
         nb_virtual_machine.vcpus = pve_container_config.get('cores', 1)
         nb_virtual_machine.memory = int(pve_container_config.get('memory', 512))
@@ -506,7 +496,7 @@ def _process_pve_virtual_machine(
         logger.debug('      QEMU guest agent not enabled, skipping agent data')
     if agent_enabled and vm_is_running and agent_data_by_mac:
         logger.debug(f'      Total agent interfaces found: {len(agent_data_by_mac)} (will match with Proxmox config by MAC)')
-    vm_role_id = _get_role_id(_nb_objects, os.getenv('VM_ROLE'))
+    vm_role_id = _get_role_id(_nb_objects, _cfg().vm_role)
     vm_name = _pve_virtual_machine['name']
     is_locked = _is_pve_entity_transiently_locked(_pve_virtual_machine)
     nb_virtual_machine = _get_nb_vm_for_sync(_nb_api, _nb_objects, _pve_virtual_machine['vmid'], vm_name)
@@ -515,7 +505,7 @@ def _process_pve_virtual_machine(
             'serial': _pve_virtual_machine['vmid'],
             'name': vm_name,
             'site': _nb_device.site.id,
-            'cluster': os.environ.get('NB_CLUSTER_ID', 1),
+            'cluster': _cfg().nb_cluster_id,
             'device': _nb_device.id,
             'vcpus': _get_virtual_machine_vcpus(pve_virtual_machine_config),
             'memory': int(pve_virtual_machine_config['memory']),
@@ -539,7 +529,7 @@ def _process_pve_virtual_machine(
         nb_virtual_machine.serial = _pve_virtual_machine['vmid']
         nb_virtual_machine.name = vm_name
         nb_virtual_machine.site = _nb_device.site.id
-        nb_virtual_machine.cluster = os.environ.get('NB_CLUSTER_ID', 1)
+        nb_virtual_machine.cluster = _cfg().nb_cluster_id
         nb_virtual_machine.device = _nb_device.id
         nb_virtual_machine.vcpus = _get_virtual_machine_vcpus(pve_virtual_machine_config)
         nb_virtual_machine.memory = int(pve_virtual_machine_config['memory'])
@@ -650,7 +640,7 @@ def _resolve_primary_ip_assignments(
     Within a subnet candidate IPs are sorted, so the result is deterministic
     regardless of the order Proxmox/agent returns interfaces.
     """
-    primary_subnets = _config.primary_subnets if _config is not None else ()
+    primary_subnets = _cfg().primary_subnets
     if not primary_subnets:
         return
 
@@ -1252,64 +1242,23 @@ def _get_virtual_machine_vcpus(_pve_virtual_machine_config: dict) -> int:
     return _pve_virtual_machine_config['cores'] * _pve_virtual_machine_config['sockets']
 
 
-def quick_check_changes(_pve_api: ProxmoxAPI, _last_state: dict) -> tuple[list[int], dict]:
+def quick_check_changes(_pve_api: ProxmoxAPI, _last_state: Dict) -> Tuple[List[int], Dict]:
     """
     Quick check for VM changes without loading full config.
-    Returns (list of changed vmid, current_state dict). Uses SYNC_VMS/SYNC_LXC env.
+
+    Thin wrapper over :func:`pve2netbox.api.proxmox.quick_check_changes`, kept so
+    the historical import path keeps working. There is deliberately only one
+    implementation: the previous duplicate here ignored
+    ``IGNORE_STATUS_WHEN_LOCKED`` and silently reintroduced changelog noise
+    whenever it was used as a fallback.
+
+    Returns:
+        (list of changed vmid, current state dict).
     """
-    current_state = {}
-    sync_vms = os.getenv('SYNC_VMS', 'true').lower() == 'true'
-    sync_lxc = os.getenv('SYNC_LXC', 'true').lower() == 'true'
-    ignore_locked = os.getenv('IGNORE_STATUS_WHEN_LOCKED', 'true').lower() == 'true'
-
-    def _resolve_status(entity: dict, prev: dict) -> str:
-        """Reuse last-known status while PVE holds a transient lock (e.g. backup)."""
-        if ignore_locked and entity.get('lock') in TRANSIENT_PVE_LOCKS:
-            prev_status = prev.get('status') if isinstance(prev, dict) else None
-            if prev_status is not None:
-                return prev_status
-        return entity['status']
-
-    for pve_node in _pve_api.nodes.get():
-        node_name = pve_node['node']
-        if sync_vms:
-            try:
-                for vm in _pve_api.nodes(node_name).qemu.get():
-                    current_state[vm['vmid']] = {
-                        'type': 'qemu',
-                        'status': _resolve_status(vm, _last_state.get(vm['vmid'], {})),
-                        'name': vm['name'],
-                        'node': node_name,
-                        'maxmem': vm.get('maxmem', 0),
-                        'maxdisk': vm.get('maxdisk', 0),
-                    }
-            except Exception as e:
-                logger.warning(f'Failed to get QEMU VMs from node {node_name}: {e}')
-        if sync_lxc:
-            try:
-                for ct in _pve_api.nodes(node_name).lxc.get():
-                    current_state[ct['vmid']] = {
-                        'type': 'lxc',
-                        'status': _resolve_status(ct, _last_state.get(ct['vmid'], {})),
-                        'name': ct['name'],
-                        'node': node_name,
-                        'maxmem': ct.get('maxmem', 0),
-                        'maxdisk': ct.get('maxdisk', 0),
-                    }
-            except Exception as e:
-                logger.warning(f'Failed to get LXC containers from node {node_name}: {e}')
-    changed_vmids = []
-    for vmid, data in current_state.items():
-        if vmid not in _last_state or _last_state[vmid] != data:
-            changed_vmids.append(vmid)
-    for vmid in _last_state:
-        if vmid not in current_state:
-            changed_vmids.append(vmid)
-    
-    return changed_vmids, current_state
+    return _api_quick_check_changes(_pve_api, _last_state, _cfg())
 
 
-def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: list[int]) -> dict:
+def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: List[int]) -> Dict:
     """
     Load from NetBox only objects related to the given VM IDs.
     Lighter-weight than _load_nb_objects for incremental (quick) sync.
@@ -1399,7 +1348,7 @@ def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: list[int]) -> 
 def sync_specific_vms(
         _pve_api: ProxmoxAPI,
         _nb_api: pynetbox.api,
-        _changed_vmids: list[int],
+        _changed_vmids: List[int],
 ) -> None:
     """
     Sync only the given VM IDs to NetBox (incremental quick sync).
@@ -1418,7 +1367,7 @@ def sync_specific_vms(
             pve_vm_tags[pve_vm_resource['vmid']] = []
             if 'pool' in pve_vm_resource:
                 pve_vm_tags[pve_vm_resource['vmid']].append(f'Pool/{pve_vm_resource["pool"]}')
-            if _config.sync_tags and 'tags' in pve_vm_resource:
+            if _cfg().sync_tags and 'tags' in pve_vm_resource:
                 for _raw_tag in pve_vm_resource['tags'].split(';'):
                     _tag_name = _raw_tag.strip()
                     if _tag_name:
@@ -1437,13 +1386,11 @@ def sync_specific_vms(
         node_name = pve_node['node']
         nodes_info[node_name] = pve_node
         vms_by_node[node_name] = {'qemu': [], 'lxc': []}
-        sync_vms = os.getenv('SYNC_VMS', 'true').lower() == 'true'
-        if sync_vms:
+        if _cfg().sync_vms:
             for vm in _pve_api.nodes(node_name).qemu.get():
                 if vm['vmid'] in _changed_vmids:
                     vms_by_node[node_name]['qemu'].append(vm)
-        sync_lxc = os.getenv('SYNC_LXC', 'true').lower() == 'true'
-        if sync_lxc:
+        if _cfg().sync_lxc:
             for ct in _pve_api.nodes(node_name).lxc.get():
                 if ct['vmid'] in _changed_vmids:
                     vms_by_node[node_name]['lxc'].append(ct)
@@ -1458,12 +1405,21 @@ def sync_specific_vms(
         
         nb_device = nb_objects['devices'].get(node_name.lower())
         if nb_device is None:
-            logger.warning(f'Device {node_name} not found in NetBox, skipping.')
+            # NODE_MISSING_POLICY=fail is enforced by the full sync; a quick check
+            # must never take the daemon down mid-cycle.
+            sync_errors += 1
+            logger.error(
+                f'Node {node_name} has no matching device in NetBox, skipping its VMs.'
+            )
             continue
         pve_node = nodes_info[node_name]
-        nb_device.status = 'active' if pve_node['status'] == 'online' else 'offline'
-        nb_device.save()
+        if not _cfg().dry_run:
+            nb_device.status = 'active' if pve_node['status'] == 'online' else 'offline'
+            nb_device.save()
         for vm in vms['qemu']:
+            if shutdown.should_stop():
+                logger.warning('Quick sync interrupted by shutdown request')
+                return
             logger.info(f'    Quick sync VM: {vm["name"]} (ID: {vm["vmid"]})')
             try:
                 _process_pve_virtual_machine(
@@ -1483,6 +1439,9 @@ def sync_specific_vms(
                     exc_info=True,
                 )
         for ct in vms['lxc']:
+            if shutdown.should_stop():
+                logger.warning('Quick sync interrupted by shutdown request')
+                return
             logger.info(f'    Quick sync LXC: {ct["name"]} (ID: {ct["vmid"]})')
             try:
                 _process_pve_lxc_container(
@@ -1549,34 +1508,50 @@ def cleanup_stale_vms(nb_api: pynetbox.api, nb_objects: dict, current_vmids: set
             logger.error(f'Failed to delete VM {nb_vm.name}: {e}')
 
 
-def main():
+def main(
+        config: Optional[Config] = None,
+        pve_api: Optional[ProxmoxAPI] = None,
+        nb_api: Optional[pynetbox.api] = None,
+) -> None:
     """
-    Main entrypoint: load config, connect to Proxmox and NetBox, provision custom fields
-    and roles, load NetBox objects, then sync all nodes/VMs/LXC. Metrics server is
-    started in __main__.py so it runs once per process, not on every sync cycle.
+    Run one full synchronization: provision custom fields and roles, load NetBox
+    objects, then sync all nodes/VMs/LXC.
+
+    Args:
+        config: Configuration to use. Loaded from the environment when omitted.
+        pve_api: Existing Proxmox client to reuse; created when omitted.
+        nb_api: Existing NetBox client to reuse; created when omitted.
+
+    The HTTP server for metrics and health endpoints is started by the CLI so it
+    runs once per process, not on every sync cycle.
     """
-    global _config
-    _config = load_config()
+    if config is not None:
+        set_config(config)
+    config = _cfg()
     log_section('Starting pve2netbox')
-    
-    if _config.dry_run:
-        logger.warning('DRY RUN MODE: No changes will be made to NetBox')
-    pve_api = ProxmoxAPI(
-        host=_config.pve_api_host,
-        user=_config.pve_api_user,
-        token_name=_config.pve_api_token,
-        token_value=_config.pve_api_secret,
-        verify_ssl=_config.pve_api_verify_ssl,
-    )
-    nb_api = pynetbox.api(
-        url=_config.nb_api_url,
-        token=_config.nb_api_token,
-    )
-    nb_api.http_session = _make_netbox_session()
+
+    if config.dry_run:
+        logger.warning(
+            'DRY RUN MODE: provisioning, node status and cleanup are skipped '
+            '(see README for the current limits of DRY_RUN)'
+        )
+
+    if pve_api is None:
+        pve_api = create_proxmox_api(config)
+    if nb_api is None:
+        nb_api = pynetbox.api(
+            url=config.nb_api_url,
+            token=config.nb_api_token,
+        )
+        nb_api.http_session = _make_netbox_session()
+    if config.nb_cluster_id is None:
+        # Only NB_CLUSTER_NAME was given and nobody resolved it yet.
+        resolve_cluster(nb_api, config)
+
+    sync_start_time = metrics.record_full_sync_start()
     _provision_custom_fields(nb_api)
     _provision_roles(nb_api)
     nb_objects = _load_nb_objects(nb_api)
-    sync_start_time = time.time()
     current_vmids = set()
     logger.info('Processing Proxmox tags...')
     _process_pve_tags(
@@ -1592,7 +1567,7 @@ def main():
         if 'pool' in pve_vm_resource:
             pve_vm_tags[pve_vm_resource['vmid']].append(f'Pool/{pve_vm_resource["pool"]}')
 
-        if _config.sync_tags and 'tags' in pve_vm_resource:
+        if config.sync_tags and 'tags' in pve_vm_resource:
             for _raw_tag in pve_vm_resource['tags'].split(';'):
                 _tag_name = _raw_tag.strip()
                 if _tag_name:
@@ -1610,21 +1585,36 @@ def main():
     lxc_count = 0
     
     sync_errors = 0
+    interrupted = False
     for pve_node in pve_api.nodes.get():
+        if shutdown.should_stop():
+            interrupted = True
+            break
         logger.info(f'  Processing node: {pve_node["node"]}')
         pve_replicated_virtual_machine_ids = list(
             map(lambda r: r['guest'], pve_api.nodes(pve_node['node']).replication.get())
         )
         nb_device = nb_objects['devices'].get(pve_node['node'].lower())
         if nb_device is None:
-            logger.error(f'The device {pve_node["node"]} is not created on NetBox. Exiting.')
-            sys.exit(1)
-        else:
-            if not _config.dry_run:
-                nb_device.status = 'active' if pve_node['status'] == 'online' else 'offline'
-                nb_device.save()
-        if _config.sync_vms:
+            sync_errors += 1
+            message = (
+                f'Node {pve_node["node"]} has no matching device in NetBox. '
+                f'Create a device named "{pve_node["node"]}" in NetBox '
+                f'(names must match exactly, case-insensitively).'
+            )
+            if config.node_missing_policy == 'fail':
+                logger.error(f'{message} Exiting (NODE_MISSING_POLICY=fail).')
+                sys.exit(1)
+            logger.error(f'{message} Skipping the node (NODE_MISSING_POLICY=skip).')
+            continue
+        if not config.dry_run:
+            nb_device.status = 'active' if pve_node['status'] == 'online' else 'offline'
+            nb_device.save()
+        if config.sync_vms:
             for pve_virtual_machine in pve_api.nodes(pve_node['node']).qemu.get():
+                if shutdown.should_stop():
+                    interrupted = True
+                    break
                 logger.info(f'    Processing VM: {pve_virtual_machine["name"]} (ID: {pve_virtual_machine["vmid"]})')
                 current_vmids.add(pve_virtual_machine["vmid"])
                 vm_count += 1
@@ -1647,8 +1637,13 @@ def main():
                         f'(ID: {pve_virtual_machine["vmid"]}): {e}',
                         exc_info=True,
                     )
-        if _config.sync_lxc:
+        if interrupted:
+            break
+        if config.sync_lxc:
             for pve_container in pve_api.nodes(pve_node['node']).lxc.get():
+                if shutdown.should_stop():
+                    interrupted = True
+                    break
                 logger.info(f'    Processing LXC: {pve_container["name"]} (ID: {pve_container["vmid"]})')
                 current_vmids.add(pve_container["vmid"])
                 lxc_count += 1
@@ -1671,11 +1666,19 @@ def main():
                         f'(ID: {pve_container["vmid"]}): {e}',
                         exc_info=True,
                     )
-    if _config.enable_cleanup:
-        cleanup_stale_vms(nb_api, nb_objects, current_vmids, _config.dry_run)
-    metrics.record_full_sync_end(sync_start_time, vm_count, lxc_count)
-    
-    if sync_errors:
+    if interrupted:
+        # A partial pass must not mark cleanup safe: VMs of nodes that were never
+        # visited would look stale and be deleted from NetBox.
+        logger.warning('Sync interrupted by shutdown request; skipping cleanup')
+    elif config.enable_cleanup:
+        cleanup_stale_vms(nb_api, nb_objects, current_vmids, config.dry_run)
+
+    succeeded = sync_errors == 0 and not interrupted
+    metrics.record_full_sync_end(sync_start_time, vm_count, lxc_count, success=succeeded)
+
+    if interrupted:
+        log_section('Sync interrupted')
+    elif sync_errors:
         log_section('Sync completed with errors')
         logger.warning(f'Sync finished with {sync_errors} error(s)')
     else:
@@ -1683,7 +1686,3 @@ def main():
     logger.info(f'Synchronized {vm_count} VMs and {lxc_count} LXC containers')
     logger.info(f'Duration: {time.time() - sync_start_time:.2f}s')
 
-
-if __name__ == '__main__':
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    main()

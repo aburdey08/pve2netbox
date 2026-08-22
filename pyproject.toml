@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pve2netbox"
-version = "1.0.7"
+version = "1.0.8"
 authors = [
     { name = "Andrew Burdey", email = "a.burdey08@gmail.com" },
 ]
@@ -15,9 +15,14 @@ maintainers = [
 ]
 description = "Synchronize Proxmox Virtual Environment (PVE) information to a NetBox instance"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
 ]
 dependencies = [
@@ -33,7 +38,14 @@ Changelog = "https://github.com/aburdey08/pve2netbox/blob/master/Changelog.md"
 Original = "https://git.creekorful.cloud/creekorful/netbox-pve-sync"
 
 [project.scripts]
-pve2netbox = "pve2netbox:master"
+pve2netbox = "pve2netbox.cli:run"
+
+[project.optional-dependencies]
+dev = [
+    "pylint>=3.3",
+    "build>=1.2",
+    "twine>=6.1",
+]
 
 [project.license]
 file = "LICENSE.txt"

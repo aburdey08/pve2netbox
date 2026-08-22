@@ -44,6 +44,22 @@ logger = setup_logger()
 """Global logger instance for the application."""
 
 
+def set_log_level(level: Optional[str] = None) -> None:
+    """
+    Re-apply the log level to the already-created global logger.
+
+    Needed because the logger is configured at import time, before command-line
+    arguments and any ``.env`` file have been processed: once LOG_LEVEL is known
+    for real, the level has to be pushed onto the existing logger and handlers.
+    """
+    if level is None:
+        level = os.getenv('LOG_LEVEL', 'INFO')
+    resolved = getattr(logging, str(level).upper(), logging.INFO)
+    logger.setLevel(resolved)
+    for handler in logger.handlers:
+        handler.setLevel(resolved)
+
+
 def log_section(title: str) -> None:
     """Log a section header for better readability."""
     logger.info('=' * 60)

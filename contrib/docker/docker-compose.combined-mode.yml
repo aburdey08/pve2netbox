@@ -4,7 +4,7 @@
 
 services:
   pve2netbox:
-    image: aburdey/pve2netbox:1.0.7
+    image: aburdey/pve2netbox:1.0.8
     environment:
       # PVE API (required — replace with your values)
       - PVE_API_HOST=10.10.0.10
@@ -33,6 +33,10 @@ services:
       - LOG_LEVEL=INFO
       - ENABLE_METRICS=false
       - METRICS_PORT=9090
+      # Health endpoints /healthz and /readyz (used by the container healthcheck)
+      - ENABLE_HEALTH_ENDPOINT=true
+      # skip = log and continue when a Proxmox node has no device in NetBox; fail = exit
+      - NODE_MISSING_POLICY=skip
     ports:
       - "9090:9090"
     restart: unless-stopped

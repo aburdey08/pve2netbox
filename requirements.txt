@@ -1,6 +1,5 @@
+# Runtime dependencies are declared in pyproject.toml; this file pins them for
+# reproducible deployments. Development tools: pip install -e '.[dev]'
 pynetbox==7.4.1
 proxmoxer==2.2.0
 requests==2.32.3
-pylint==3.3.4
-build==1.2.2.post1
-twine==6.1.0

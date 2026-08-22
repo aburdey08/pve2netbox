@@ -1,12 +1,13 @@
 """NetBox API adapter with rate limiting and provisioning."""
 
+import sys
 import time
 from typing import Dict, Any, Optional
 import requests
 import pynetbox
 from urllib3.util.retry import Retry
 
-from ..config import Config, ROLE_COLORS
+from ..config import Config, PROXMOX_CLUSTER_TYPE, ROLE_COLORS
 from ..logger import logger
 
 
@@ -159,6 +160,89 @@ def provision_roles(nb_api: pynetbox.api, config: Config, dry_run: bool = False)
             logger.info(f'  + Created role "{role_def["name"]}"')
         except Exception as e:
             logger.error(f'  ! Failed to create role "{role_def["name"]}": {e}')
+
+
+def resolve_cluster(nb_api: pynetbox.api, config: Config) -> int:
+    """
+    Resolve the NetBox cluster the VMs belong to and validate that it exists.
+
+    ``NB_CLUSTER_NAME`` is looked up by name and provisioned (together with the
+    ``Proxmox VE`` cluster type) when missing; ``NB_CLUSTER_ID`` must already
+    exist. Sets and returns ``config.nb_cluster_id``.
+
+    Exits with a clear message instead of letting every VM write fail later with
+    an opaque NetBox API error.
+    """
+    if config.nb_cluster_name:
+        cluster = nb_api.virtualization.clusters.get(name=config.nb_cluster_name)
+        if cluster is not None:
+            # Both variables set: they must agree. Silently preferring the name
+            # would move every VM into a different cluster than the ID names.
+            if config.nb_cluster_id is not None and cluster.id != config.nb_cluster_id:
+                logger.error(
+                    f'NB_CLUSTER_ID and NB_CLUSTER_NAME disagree: cluster '
+                    f'"{cluster.name}" has ID {cluster.id}, but NB_CLUSTER_ID is '
+                    f'{config.nb_cluster_id}. Set only one of them, or make them match.'
+                )
+                sys.exit(1)
+            logger.info(f'Using NetBox cluster "{cluster.name}" (ID: {cluster.id})')
+            config.nb_cluster_id = cluster.id
+            return cluster.id
+
+        if config.nb_cluster_id is not None:
+            logger.error(
+                f'NB_CLUSTER_ID is {config.nb_cluster_id}, but no cluster named '
+                f'"{config.nb_cluster_name}" exists. Refusing to create one while an '
+                f'explicit ID is configured — set only one of the two variables.'
+            )
+            sys.exit(1)
+
+        if config.dry_run:
+            logger.error(
+                f'NetBox cluster "{config.nb_cluster_name}" does not exist and cannot be '
+                f'created in dry-run mode. Create it manually or set NB_CLUSTER_ID.'
+            )
+            sys.exit(1)
+
+        cluster_type = _ensure_cluster_type(nb_api)
+        cluster = nb_api.virtualization.clusters.create(
+            name=config.nb_cluster_name,
+            slug=config.nb_cluster_name.lower().replace(' ', '-'),
+            type=cluster_type.id,
+        )
+        logger.info(f'  + Created NetBox cluster "{cluster.name}" (ID: {cluster.id})')
+        config.nb_cluster_id = cluster.id
+        return cluster.id
+
+    cluster = nb_api.virtualization.clusters.get(config.nb_cluster_id)
+    if cluster is None:
+        available = ', '.join(
+            f'{c.id}={c.name}' for c in nb_api.virtualization.clusters.all()
+        ) or 'none'
+        logger.error(
+            f'NetBox cluster with ID {config.nb_cluster_id} does not exist. '
+            f'Available clusters: {available}. '
+            f'Set NB_CLUSTER_ID to an existing ID, or use NB_CLUSTER_NAME to create one.'
+        )
+        sys.exit(1)
+
+    logger.info(f'Using NetBox cluster "{cluster.name}" (ID: {cluster.id})')
+    return cluster.id
+
+
+def _ensure_cluster_type(nb_api: pynetbox.api) -> Any:
+    """Return the ``Proxmox VE`` cluster type, creating it if missing."""
+    cluster_type = nb_api.virtualization.cluster_types.get(name=PROXMOX_CLUSTER_TYPE)
+    if cluster_type is not None:
+        return cluster_type
+
+    cluster_type = nb_api.virtualization.cluster_types.create(
+        name=PROXMOX_CLUSTER_TYPE,
+        slug='proxmox-ve',
+        description='Proxmox Virtual Environment',
+    )
+    logger.info(f'  + Created NetBox cluster type "{PROXMOX_CLUSTER_TYPE}"')
+    return cluster_type
 
 
 def load_nb_objects(nb_api: pynetbox.api) -> Dict[str, Dict[str, Any]]:

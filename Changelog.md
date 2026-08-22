@@ -1,5 +1,76 @@
 # pve2netbox
 
+## [1.0.8] - 2026-08-22
+
+Reliability release: the documented installation methods work again, and the daemon starts, runs
+and stops correctly.
+
+### Fixed
+
+- **Console script `pve2netbox` was broken.** `pyproject.toml` pointed the entry point at a
+  non-existent `pve2netbox:master`, so `pip install .` produced a command that failed with
+  `AttributeError`. Mode dispatch also lived under `if __name__ == '__main__'` in `__main__.py`,
+  so the console script could never have run the interval modes. All mode handling moved to the
+  new `pve2netbox/cli.py`; `pve2netbox` and `python -m pve2netbox` now behave identically.
+- **`.env` files were never read.** The README documented running `pve2netbox` with a `.env` file,
+  but nothing in the code loaded one. Added `--env-file PATH`, `$PVE2NETBOX_ENV_FILE` and
+  auto-discovery of `./.env`. Variables already present in the environment win over the file, so
+  Docker and systemd values are never shadowed.
+- **`NB_CLUSTER_ID` silently defaulted to cluster `1`.** The value was read directly from the
+  environment in six places, bypassing the parsed configuration; a missing or wrong ID surfaced as
+  an opaque NetBox API error on the first VM. The cluster is now validated at startup, and
+  configuration is read in exactly one place.
+- **A Proxmox node without a matching NetBox device killed the process** via `sys.exit(1)` in the
+  middle of a sync. Controlled by the new `NODE_MISSING_POLICY` (default `skip`).
+- **`requires-python` claimed 3.8**, but PEP 585 annotations evaluated at import time made the
+  package unimportable there. The real minimum, 3.9, is now declared.
+- **The Docker `HEALTHCHECK` was a no-op** (`python -c "import sys; sys.exit(0)"`) and reported
+  every container as healthy. It now queries `/readyz`.
+- **A NetBox outage at startup crashed the process**; the looping modes now retry until NetBox
+  answers or a shutdown is requested.
+- **Quick check silently fell back to a legacy implementation** on any exception — including
+  ordinary network errors — and that implementation ignored `IGNORE_STATUS_WHEN_LOCKED`,
+  reintroducing the changelog noise fixed in 1.0.6. There is now a single implementation.
+
+### Added
+
+- **`NB_CLUSTER_NAME`** — target the NetBox cluster by name instead of by ID; created together with
+  the `Proxmox VE` cluster type when missing. Any existing cluster ID keeps working — the removed
+  hard-coded `1` was the bug. Setting both `NB_CLUSTER_ID` and `NB_CLUSTER_NAME` is allowed only
+  when they refer to the same cluster; a mismatch is a startup error instead of a silent choice.
+- **`NODE_MISSING_POLICY`** (`skip` | `fail`, default `skip`) — what to do when a Proxmox node has
+  no matching device in NetBox.
+- **`ENABLE_HEALTH_ENDPOINT`** (default `true`) — `/healthz` (liveness) and `/readyz` (readiness,
+  503 while the last successful full sync is older than two sync intervals) on `METRICS_PORT`,
+  served whether or not `/metrics` is enabled.
+- **Graceful shutdown.** SIGTERM and SIGINT stop the run at the next node or VM boundary and exit
+  with code 0, instead of being killed mid-write after the container stop timeout. A second signal
+  exits immediately. An interrupted run never performs `ENABLE_CLEANUP` deletions.
+- **`--version`, `--help`, `--env-file`** on the command line, plus the
+  `pve2netbox_build_info{version=...}` metric.
+- **`pve2netbox_last_success_timestamp_seconds`** — timestamp of the last *successful* full sync,
+  separate from `pve2netbox_last_sync_timestamp_seconds`, which now marks the last attempt. The
+  Grafana dashboard's "Last sync" panel uses the new metric.
+- Startup now logs the effective configuration (no secrets) and warns that `PVE_API_VERIFY_SSL`
+  is disabled.
+
+### Changed
+
+- **Documentation fix:** `PVE_API_VERIFY_SSL` has always defaulted to `false`; the README claimed
+  `true`. The default becomes `true` in 2.0.0 — set the variable explicitly to keep today's
+  behaviour. All samples in `contrib/` already do.
+- Boolean environment variables are validated: an unparseable value is a configuration error
+  rather than a silent `false`.
+- `setup.py` and `setup.cfg` removed — `pyproject.toml` is the only source of packaging metadata.
+  Development tools moved to `pip install -e '.[dev]'`; `requirements.txt` now pins runtime
+  dependencies only.
+
+### Known issue
+
+- **`DRY_RUN` is only partial.** It suppresses provisioning, node status updates and cleanup, but
+  VM, interface, IP and disk records are still written to NetBox. Documented in the README; a fix
+  is planned for a following release.
+
 ## [1.0.7] - 2026-05-10
 
 ### Added

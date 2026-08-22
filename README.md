@@ -14,7 +14,7 @@ Pick **one** of the two recommended options. Both use **Combined mode** — quic
 
 Before you start, you need:
 
-- A **NetBox** API token with write access and (optionally) `NB_CLUSTER_ID`.
+- A **NetBox** API token with write access and a target cluster (`NB_CLUSTER_ID` or `NB_CLUSTER_NAME`).
 - A **Proxmox VE** user + API token with `Pool.Audit`, `VM.Audit`, `Sys.Audit`.
 - Physical nodes already created in NetBox with names **matching** Proxmox node names.
 
@@ -74,19 +74,26 @@ Minimum required variables — set these in the compose file or `/etc/pve2netbox
 | `PVE_API_SECRET` | PVE API token secret |
 | `NB_API_URL` | NetBox URL (e.g. `https://netbox.example.org`) |
 | `NB_API_TOKEN` | NetBox API token |
+| `NB_CLUSTER_ID` **or** `NB_CLUSTER_NAME` | Target NetBox cluster — an existing ID, or a name that is created if missing |
+
+Any existing cluster ID works — nothing assumes `1`. `NB_CLUSTER_ID` must point at a cluster that
+already exists; `NB_CLUSTER_NAME` is created (together with the `Proxmox VE` cluster type) when
+missing. Setting both is allowed only when they refer to the same cluster; a mismatch is reported as
+a configuration error rather than silently picking one.
 
 Common optional variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NB_CLUSTER_ID` | — | NetBox cluster ID |
-| `PVE_API_VERIFY_SSL` | `true` | Verify PVE SSL cert |
+| `PVE_API_VERIFY_SSL` | `false` | Verify PVE SSL cert. **Changes to `true` in 2.0.0** — set it explicitly now |
 | `VM_ROLE` / `LXC_ROLE` | — | NetBox device role for VMs / LXC (created if missing) |
 | `SYNC_VMS` / `SYNC_LXC` / `SYNC_TAGS` | `true` | Enable/disable each sync type |
-| `DRY_RUN` | `false` | Log changes without writing to NetBox |
+| `NODE_MISSING_POLICY` | `skip` | Proxmox node with no matching NetBox device: `skip` (log and continue) or `fail` (stop the run) |
+| `DRY_RUN` | `false` | **Partial** — see [Dry-run limitations](#dry-run-limitations) below |
 | `ENABLE_CLEANUP` | `false` | Delete from NetBox VMs missing in PVE (**use with care**) |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `ENABLE_METRICS` / `METRICS_PORT` | `false` / `9090` | Prometheus metrics on `/metrics` |
+| `ENABLE_HEALTH_ENDPOINT` | `true` | `/healthz` and `/readyz` on `METRICS_PORT` |
 | `PRIMARY_SUBNETS` | — | Comma/space-separated subnets used to pick `primary_ip4`/`primary_ip6` (first matching subnet wins, IPv4/IPv6 independent). Empty = leave `primary_ip*` untouched. Example: `192.168.88.0/24, 2001:db8::/64` |
 
 Full list and comments: [.env.example](.env.example).
@@ -114,7 +121,10 @@ For special cases — see dedicated docs:
 - **Docker** (all three modes): [contrib/docker/](contrib/docker/)
 - **LXC** (deploy, update, install into existing container): [contrib/lxc/](contrib/lxc/)
 - **systemd** on host / bare LXC: [contrib/systemd/](contrib/systemd/)
-- **pip3 from source** — `pip install .` in repo root, then run `pve2netbox` with a `.env` file
+- **pip3 from source** — `pip install .` in repo root, then run `pve2netbox`. Configuration comes
+  from the environment, from `--env-file PATH`, from `$PVE2NETBOX_ENV_FILE`, or from a `.env` file in
+  the current directory. Variables already set in the environment take precedence over the file.
+  `pve2netbox --help` lists the options. Requires Python 3.9+
 
 ---
 
@@ -142,11 +152,37 @@ Hits the Proxmox VE API, reads VMs/LXC, and creates/updates NetBox objects accor
 
 ---
 
-## Prometheus metrics
+## Prometheus metrics and health endpoints
 
-Set `ENABLE_METRICS=true` (port `METRICS_PORT`, default `9090`) — exposes at `http://host:9090/metrics`:
+One HTTP server on `METRICS_PORT` (default `9090`) serves both:
 
-`pve2netbox_full_syncs_total`, `pve2netbox_quick_checks_total`, `pve2netbox_vms_synced_total`, `pve2netbox_lxc_synced_total`, `pve2netbox_errors_total`, `pve2netbox_vms_tracked`, `pve2netbox_last_sync_duration_seconds`.
+| Endpoint | Enabled by | Meaning |
+|----------|-----------|---------|
+| `/metrics` | `ENABLE_METRICS=true` | Prometheus exposition format |
+| `/healthz` | `ENABLE_HEALTH_ENDPOINT=true` (default) | Liveness — 200 while the process runs |
+| `/readyz` | `ENABLE_HEALTH_ENDPOINT=true` (default) | Readiness — 503 when no sync has succeeded yet, or the last successful full sync is older than two sync intervals |
+
+The Docker image's `HEALTHCHECK` uses `/readyz`, so a container whose syncs are failing is reported
+as `unhealthy` instead of merely logging errors.
+
+Metrics: `pve2netbox_build_info`, `pve2netbox_full_syncs_total`, `pve2netbox_quick_checks_total`,
+`pve2netbox_vms_synced_total`, `pve2netbox_lxc_synced_total`, `pve2netbox_errors_total`,
+`pve2netbox_vms_tracked`, `pve2netbox_lxc_tracked`, `pve2netbox_last_sync_duration_seconds`,
+`pve2netbox_last_sync_timestamp_seconds` (last attempt), `pve2netbox_last_success_timestamp_seconds`
+(last success — alert on this one), `pve2netbox_changes_detected`.
+
+## Dry-run limitations
+
+`DRY_RUN=true` currently suppresses only custom field and role provisioning, node status updates and
+cleanup. **VM, interface, IP and disk records are still written to NetBox.** Use a test NetBox
+instance until this is fixed.
+
+## Shutdown behaviour
+
+SIGTERM and SIGINT are handled cooperatively: the current object finishes syncing, the run stops at
+the next node or VM boundary, and the process exits with code 0. `docker stop` and
+`systemctl restart` no longer interrupt a write half-way. A partial run never triggers
+`ENABLE_CLEANUP` deletions.
 
 ---
 
