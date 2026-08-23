@@ -8,6 +8,7 @@
 #
 # In interactive mode (run from terminal) it prompts for: container ID, name, storage.
 # Variables (optional): CTID, STORAGE, BRIDGE, HOSTNAME, ROOTFS_SIZE, MEMORY, TEMPLATE_STORAGE
+# REPO_BRANCH=my-branch ./deploy-from-pve.sh   # install/test a specific git branch instead of master
 #
 # If .env exists next to the script or in repo root, it is copied into the container as /etc/pve2netbox/env.
 #
@@ -36,7 +37,8 @@ ROOTFS_SIZE="${ROOTFS_SIZE:-2}"  # GiB
 MEMORY="${MEMORY:-256}"          # MiB
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
 NO_INSTALL="${NO_INSTALL:-}"
-REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/aburdey08/pve2netbox/master}"
+REPO_BRANCH="${REPO_BRANCH:-master}"
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/aburdey08/pve2netbox/$REPO_BRANCH}"
 REPO_GIT="${REPO_GIT:-https://github.com/aburdey08/pve2netbox.git}"
 
 for arg in "$@"; do
@@ -44,7 +46,7 @@ for arg in "$@"; do
     --no-install) NO_INSTALL=1 ;;
     -h|--help)
       echo "Usage: $0 [--no-install]"
-      echo "Variables: CTID, STORAGE, BRIDGE, LXC_HOSTNAME (or HOSTNAME), ROOTFS_SIZE, MEMORY, TEMPLATE_STORAGE, REPO_RAW, REPO_GIT"
+      echo "Variables: CTID, STORAGE, BRIDGE, LXC_HOSTNAME (or HOSTNAME), ROOTFS_SIZE, MEMORY, TEMPLATE_STORAGE, REPO_BRANCH, REPO_RAW, REPO_GIT"
       exit 0
       ;;
     *)
@@ -175,14 +177,14 @@ sleep 15
 if [[ -n "$NO_INSTALL" ]]; then
   echo "[*] --no-install mode: app installation skipped."
   echo "    Manual install (ensure curl in container first: apt-get install -y curl):"
-  echo "    pct exec $CTID -- env REPO_GIT=\"$REPO_GIT\" bash -c 'curl -sL $REPO_RAW/contrib/lxc/install.sh | bash'"
+  echo "    pct exec $CTID -- env REPO_BRANCH=\"$REPO_BRANCH\" REPO_GIT=\"$REPO_GIT\" bash -c 'curl -sL $REPO_RAW/contrib/lxc/install.sh | bash'"
   exit 0
 fi
 
 echo "[*] Installing pve2netbox into container $CTID..."
 echo "[*] Ensuring curl (and ca-certificates) in container..."
 pct exec "$CTID" -- bash -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates"
-pct exec "$CTID" -- env REPO_RAW="$REPO_RAW" REPO_GIT="$REPO_GIT" bash -c "curl -sL $REPO_RAW/contrib/lxc/install.sh | bash"
+pct exec "$CTID" -- env REPO_BRANCH="$REPO_BRANCH" REPO_RAW="$REPO_RAW" REPO_GIT="$REPO_GIT" bash -c "curl -sL $REPO_RAW/contrib/lxc/install.sh | bash"
 
 ENV_COPIED=""
 ENV_FILE=""

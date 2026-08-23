@@ -1,6 +1,10 @@
 """Utility functions for parsing and data processing."""
 
+import re
 from typing import Dict, Optional
+from urllib.parse import unquote
+
+_PERCENT_ESCAPE_RE = re.compile(r'%[0-9A-Fa-f]{2}')
 
 
 def parse_pve_network_definition(raw_network_definition: str) -> Dict[str, str]:
@@ -96,3 +100,36 @@ def get_mac_address_from_network_definition(network_definition: Dict[str, str]) 
         return network_definition['hwaddr']
     
     return None
+
+
+def decode_pve_description(raw_description: Optional[str], max_length: int) -> str:
+    """
+    Normalize the Proxmox ``description`` field for storage in NetBox.
+
+    Proxmox returns notes percent-encoded in some API paths and as plain text in
+    others, so decoding is applied only when the value actually contains a
+    ``%XX`` escape — otherwise a note that legitimately mentions ``100%`` or a
+    URL-ish string would be mangled. CRLF is normalized to LF, and the result is
+    truncated to ``max_length`` with an ellipsis so the field stays stable
+    instead of failing the NetBox write.
+
+    Args:
+        raw_description: Value of ``description`` from the PVE config, if any.
+        max_length: Maximum length accepted by the target NetBox field.
+
+    Returns:
+        Cleaned text, or an empty string when there is no description.
+    """
+    if not raw_description:
+        return ''
+
+    text = raw_description
+    if _PERCENT_ESCAPE_RE.search(text):
+        text = unquote(text)
+
+    text = text.replace('\r\n', '\n').replace('\r', '\n').strip()
+
+    if max_length > 0 and len(text) > max_length:
+        text = text[:max_length - 1].rstrip() + '\u2026'
+
+    return text

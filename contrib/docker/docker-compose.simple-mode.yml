@@ -4,7 +4,7 @@
 
 services:
   pve2netbox:
-    image: aburdey/pve2netbox:1.0.8
+    image: aburdey/pve2netbox:1.1.0
     environment:
       # PVE API (required — replace with your values)
       - PVE_API_HOST=10.10.0.10
@@ -25,6 +25,16 @@ services:
       - SYNC_VMS=true
       - SYNC_LXC=true
       - SYNC_TAGS=true
+      # IP addresses of LXC containers: auto (default) | runtime | config | none
+      - LXC_IP_SOURCE=auto
+      # Proxmox description (Notes) -> NetBox comments (or description)
+      - SYNC_DESCRIPTION=true
+      - DESCRIPTION_TARGET=comments
+      # ostype -> Platform, pool -> Tenant (opt-in: often maintained by hand)
+      - SYNC_PLATFORM=false
+      - POOL_AS_TENANT=false
+      # Templates: tag (mark with "pve-template") | skip | sync
+      - TEMPLATE_POLICY=tag
       - VM_ROLE=Virtual Machine
       - LXC_ROLE=LXC
       - DRY_RUN=false

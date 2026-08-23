@@ -1,5 +1,69 @@
 # pve2netbox
 
+## [1.1.0] - 2026-08-22
+
+Feature release: LXC containers finally get their IP addresses into NetBox, and VM records carry
+the Proxmox metadata that previously had to be filled in by hand.
+
+### Added
+
+- **IP addresses for LXC containers.** The largest functional gap in the project: container
+  interfaces were created without any address because containers have no guest agent. Proxmox
+  exposes the data elsewhere, and both sources are now used, selected with **`LXC_IP_SOURCE`**:
+
+  | Value | Behaviour |
+  |-------|-----------|
+  | `auto` (default) | The running container's real addresses, falling back per interface to the static config |
+  | `runtime` | Only `GET /nodes/{node}/lxc/{vmid}/interfaces` — the only source that works for DHCP |
+  | `config` | Only the static `ip=` / `ip6=` values, readable whether or not the container runs |
+  | `none` | No container IPs at all — the behaviour before 1.1.0 |
+
+  Container addresses are converted to the exact structure the QEMU guest agent produces, so they
+  travel through the same code path — which means **`PRIMARY_SUBNETS` now sets `primary_ip4` /
+  `primary_ip6` for containers too**, and disappearing addresses are cleaned up by the same logic
+  as for VMs. A container reporting `ip=dhcp` and nothing else never causes NetBox addresses to be
+  deleted, so stopping a container does not wipe its last known IP. Loopback and link-local
+  (`fe80::`) addresses are never written. A failing endpoint — older PVE, a token without
+  `VM.Audit` — logs a warning and falls back to the static configuration instead of failing the
+  container's sync.
+- **`SYNC_DESCRIPTION`** (default `true`) and **`DESCRIPTION_TARGET`** (`comments` | `description`,
+  default `comments`) — the Proxmox description, shown as *Notes* in the PVE UI, is copied to
+  NetBox. `comments` is the default because NetBox's `description` is a single short line.
+  Percent-encoded notes are decoded, and an empty description never overwrites an existing NetBox
+  value — a blank field must not produce changelog noise on every sync.
+- **`SYNC_PLATFORM`** (default `false`) and **`PLATFORM_MAP`** — map `ostype` to a NetBox platform,
+  created when missing. Precise for containers (`debian`, `alpine`, `rocky`…) and coarse for QEMU
+  (`l26`, `win11`), which is why it is opt-in: the field is often maintained by hand. The built-in
+  mapping is overridden per `ostype` with `PLATFORM_MAP=l26=Linux,win11=Windows 11`. An `ostype`
+  with no mapping leaves the field untouched.
+- **`POOL_AS_TENANT`** (default `false`) — the Proxmox pool is also written to the NetBox tenant,
+  created when missing. The existing `Pool/<poolid>` tags are unchanged and keep working. A guest
+  outside any pool leaves the tenant field alone.
+- **`TEMPLATE_POLICY`** (`tag` | `skip` | `sync`, default `tag`) — templates used to be
+  indistinguishable from real machines in the inventory, since they sync as ordinary VMs with
+  status `offline`. `tag` marks them with the `pve-template` tag, `skip` leaves them out of NetBox
+  entirely (and, with `ENABLE_CLEANUP=true`, removes ones an earlier run created), `sync` is the
+  pre-1.1.0 behaviour.
+
+### Fixed
+
+- **Prefixes were computed by string surgery** — the last octet of the IPv4 address was replaced
+  with `0` regardless of the mask, so a `/16` or `/22` address produced an invalid prefix such as
+  `10.1.2.0/16`. The containing network is now computed properly. Existing wrong prefixes are left
+  in place; NetBox shows them until they are removed by hand.
+- **An interface with IP data but no IPv4, on a VLAN-tagged bridge, raised `NameError`** on an
+  unassigned `nb_prefix`. The VLAN was only ever attached to the prefix derived from the IPv4
+  address, so there was nothing to attach in that branch; it now logs and moves on. Rare with QEMU
+  guest agents, but reachable for every IPv6-only container once 1.1.0 started supplying LXC
+  addresses.
+
+### Changed
+
+- `TEMPLATE_POLICY` defaults to `tag`, so templates gain the `pve-template` tag on the first run
+  after upgrading. No objects appear or disappear — set `TEMPLATE_POLICY=sync` to keep templates
+  completely untouched.
+- The README no longer carries the "IP sync not available" caveat for LXC.
+
 ## [1.0.8] - 2026-08-22
 
 Reliability release: the documented installation methods work again, and the daemon starts, runs

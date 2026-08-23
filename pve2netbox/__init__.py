@@ -5,6 +5,7 @@ pve2netbox: Synchronize Proxmox Virtual Environment (PVE) information to a NetBo
 """
 
 import ipaddress
+import re
 import sys
 import time
 from typing import Optional, Dict, List, Tuple, Any
@@ -17,14 +18,25 @@ from . import shutdown
 from .api.netbox import make_netbox_session, resolve_cluster
 from .api.proxmox import create_proxmox_api
 from .api.proxmox import quick_check_changes as _api_quick_check_changes
-from .config import Config, TRANSIENT_PVE_LOCKS, get_config, load_config, set_config
+from .config import (
+    Config,
+    NB_COMMENTS_MAX_LENGTH,
+    NB_DESCRIPTION_MAX_LENGTH,
+    TEMPLATE_TAG_NAME,
+    TRANSIENT_PVE_LOCKS,
+    get_config,
+    load_config,
+    set_config,
+)
 from .logger import logger, log_section
+from .lxc import build_lxc_agent_data
 from .metrics import metrics
 from .utils import (
     parse_pve_network_definition as _parse_pve_network_definition,
     parse_pve_disk_definition as _parse_pve_disk_definition,
     parse_pve_disk_size as _process_pve_disk_size,
     get_virtual_machine_vcpus as _get_virtual_machine_vcpus,
+    decode_pve_description,
 )
 from .version import __version__
 
@@ -201,6 +213,8 @@ def _load_nb_objects(_nb_api: pynetbox.api) -> dict:
         'disks': {},
         'tags': {},
         'roles': {},
+        'platforms': {},
+        'tenants': {},
     }
     logger.debug('  - Loading devices...')
     for _nb_device in _nb_api.dcim.devices.all():
@@ -240,8 +254,33 @@ def _load_nb_objects(_nb_api: pynetbox.api) -> dict:
     for _nb_role in _nb_api.dcim.device_roles.all():
         _nb_objects['roles'][_nb_role.name] = _nb_role
         _nb_objects['roles'][str(_nb_role.id)] = _nb_role
+    _load_nb_platforms_and_tenants(_nb_api, _nb_objects)
     logger.info('NetBox objects loaded.')
     return _nb_objects
+
+
+def _load_nb_platforms_and_tenants(_nb_api: pynetbox.api, _nb_objects: dict) -> None:
+    """
+    Cache NetBox platforms and tenants by name for SYNC_PLATFORM / POOL_AS_TENANT.
+
+    Both lists are small and only fetched when the corresponding feature is on,
+    so a run that does not use them costs nothing extra.
+    """
+    config = _cfg()
+    if config.sync_platform:
+        logger.debug('  - Loading platforms...')
+        try:
+            for _nb_platform in _nb_api.dcim.platforms.all():
+                _nb_objects['platforms'][_nb_platform.name] = _nb_platform
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f'Failed to load platforms: {e}')
+    if config.pool_as_tenant:
+        logger.debug('  - Loading tenants...')
+        try:
+            for _nb_tenant in _nb_api.tenancy.tenants.all():
+                _nb_objects['tenants'][_nb_tenant.name] = _nb_tenant
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f'Failed to load tenants: {e}')
 
 
 def _process_pve_tags(
@@ -274,6 +313,101 @@ def _ensure_nb_tag(tag_name: str, _nb_api: pynetbox.api, _nb_objects: dict) -> N
     slug = tag_name.lower().replace(' ', '-')
     _nb_tag = _nb_api.extras.tags.create(name=tag_name, slug=slug)
     _nb_objects['tags'][_nb_tag.name] = _nb_tag
+
+
+def _ensure_nb_platform(platform_name: str, _nb_api: pynetbox.api, _nb_objects: dict) -> Optional[int]:
+    """Return the ID of the NetBox platform named ``platform_name``, creating it if missing."""
+    nb_platform = _nb_objects['platforms'].get(platform_name)
+    if nb_platform is not None:
+        return nb_platform.id
+
+    slug = _slugify(platform_name)
+    try:
+        nb_platform = _nb_api.dcim.platforms.create(name=platform_name, slug=slug)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(f'      Warning: could not create platform "{platform_name}": {e}')
+        return None
+
+    _nb_objects['platforms'][nb_platform.name] = nb_platform
+    logger.info(f'      Created NetBox platform: {platform_name}')
+    return nb_platform.id
+
+
+def _ensure_nb_tenant(tenant_name: str, _nb_api: pynetbox.api, _nb_objects: dict) -> Optional[int]:
+    """Return the ID of the NetBox tenant named ``tenant_name``, creating it if missing."""
+    nb_tenant = _nb_objects['tenants'].get(tenant_name)
+    if nb_tenant is not None:
+        return nb_tenant.id
+
+    slug = _slugify(tenant_name)
+    try:
+        nb_tenant = _nb_api.tenancy.tenants.create(name=tenant_name, slug=slug)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(f'      Warning: could not create tenant "{tenant_name}": {e}')
+        return None
+
+    _nb_objects['tenants'][nb_tenant.name] = nb_tenant
+    logger.info(f'      Created NetBox tenant: {tenant_name}')
+    return nb_tenant.id
+
+
+def _slugify(name: str) -> str:
+    """Build a NetBox slug from a display name (``Alpine Linux`` → ``alpine-linux``)."""
+    slug = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+    return slug or 'unnamed'
+
+
+def _optional_vm_field_values(
+        _nb_api: pynetbox.api,
+        _nb_objects: dict,
+        _pve_config: dict,
+        _pve_pool: Optional[str],
+) -> dict:
+    """
+    Values for the opt-in NetBox fields: description, platform and tenant.
+
+    Only fields that are enabled *and* have something to say are returned. A
+    guest without a note, without a recognized ``ostype`` or outside any pool
+    leaves the corresponding NetBox field untouched — overwriting a manually
+    curated value with an empty one is worse than not syncing it.
+    """
+    config = _cfg()
+    values: Dict[str, Any] = {}
+
+    if config.sync_description:
+        max_length = (NB_COMMENTS_MAX_LENGTH if config.description_target == 'comments'
+                      else NB_DESCRIPTION_MAX_LENGTH)
+        description = decode_pve_description(_pve_config.get('description'), max_length)
+        if description:
+            values[config.description_target] = description
+
+    if config.sync_platform:
+        ostype = str(_pve_config.get('ostype') or '').lower()
+        platform_name = config.platform_map.get(ostype)
+        if platform_name:
+            platform_id = _ensure_nb_platform(platform_name, _nb_api, _nb_objects)
+            if platform_id is not None:
+                values['platform'] = platform_id
+        elif ostype:
+            logger.debug(f'      ostype "{ostype}" has no platform mapping, leaving platform unset')
+
+    if config.pool_as_tenant and _pve_pool:
+        tenant_id = _ensure_nb_tenant(_pve_pool, _nb_api, _nb_objects)
+        if tenant_id is not None:
+            values['tenant'] = tenant_id
+
+    return values
+
+
+def _apply_optional_vm_fields(_nb_virtual_machine: Any, _field_values: dict) -> None:
+    """
+    Apply the opt-in field values to an existing NetBox VM.
+
+    pynetbox only sends attributes that actually differ, so assigning an
+    unchanged value here does not produce a changelog entry.
+    """
+    for field_name, value in _field_values.items():
+        setattr(_nb_virtual_machine, field_name, value)
 
 
 def _is_pve_entity_transiently_locked(_pve_entity: dict) -> bool:
@@ -355,17 +489,31 @@ def _process_pve_lxc_container(
         _pve_container: dict,
         _is_replicated: bool,
         _has_ha: bool,
+        _pve_pool: Optional[str] = None,
 ) -> dict:
     """
     Sync one LXC container from Proxmox to NetBox.
     Creates or updates the VM record, then syncs network interfaces and disks.
     LXC is represented in NetBox as a virtual machine; role from LXC_ROLE env.
+    IP addresses come from LXC_IP_SOURCE (runtime interfaces and/or static config).
     """
     _pve_node_name = _nb_device.name.lower()
     pve_container_config = _pve_api.nodes(_pve_node_name).lxc(_pve_container['vmid']).config.get()
     lxc_role_id = _get_role_id(_nb_objects, _cfg().lxc_role)
     vm_name = pve_container_config.get('hostname', _pve_container['name'])
     is_locked = _is_pve_entity_transiently_locked(_pve_container)
+    container_is_running = _pve_container['status'] == 'running'
+    agent_data_by_mac = build_lxc_agent_data(
+        _pve_api,
+        _pve_node_name,
+        _pve_container['vmid'],
+        pve_container_config,
+        container_is_running,
+        _cfg().lxc_ip_source,
+    )
+    optional_fields = _optional_vm_field_values(
+        _nb_api, _nb_objects, pve_container_config, _pve_pool
+    )
     nb_virtual_machine = _get_nb_vm_for_sync(_nb_api, _nb_objects, _pve_container['vmid'], vm_name)
     if nb_virtual_machine is None:
         create_params = {
@@ -389,7 +537,8 @@ def _process_pve_lxc_container(
         }
         if lxc_role_id:
             create_params['role'] = lxc_role_id
-        
+        create_params.update(optional_fields)
+
         nb_virtual_machine = _nb_api.virtualization.virtual_machines.create(**create_params)
         _index_nb_virtual_machine(_nb_objects, nb_virtual_machine)
     else:
@@ -413,6 +562,7 @@ def _process_pve_lxc_container(
         nb_virtual_machine.custom_fields['autostart'] = pve_container_config.get('onboot') == 1
         nb_virtual_machine.custom_fields['replicated'] = _is_replicated
         nb_virtual_machine.custom_fields['ha'] = _has_ha
+        _apply_optional_vm_fields(nb_virtual_machine, optional_fields)
         nb_virtual_machine.save()
         _index_nb_virtual_machine(_nb_objects, nb_virtual_machine)
     _process_pve_lxc_network_interfaces(
@@ -420,6 +570,7 @@ def _process_pve_lxc_container(
         _nb_objects,
         pve_container_config,
         nb_virtual_machine,
+        agent_data_by_mac,
     )
     _process_pve_lxc_disks(
         _nb_api,
@@ -440,6 +591,7 @@ def _process_pve_virtual_machine(
         _pve_virtual_machine: dict,
         _is_replicated: bool,
         _has_ha: bool,
+        _pve_pool: Optional[str] = None,
 ) -> dict:
     """
     Sync one QEMU VM from Proxmox to NetBox.
@@ -496,6 +648,9 @@ def _process_pve_virtual_machine(
         logger.debug('      QEMU guest agent not enabled, skipping agent data')
     if agent_enabled and vm_is_running and agent_data_by_mac:
         logger.debug(f'      Total agent interfaces found: {len(agent_data_by_mac)} (will match with Proxmox config by MAC)')
+    optional_fields = _optional_vm_field_values(
+        _nb_api, _nb_objects, pve_virtual_machine_config, _pve_pool
+    )
     vm_role_id = _get_role_id(_nb_objects, _cfg().vm_role)
     vm_name = _pve_virtual_machine['name']
     is_locked = _is_pve_entity_transiently_locked(_pve_virtual_machine)
@@ -522,7 +677,8 @@ def _process_pve_virtual_machine(
         }
         if vm_role_id:
             create_params['role'] = vm_role_id
-        
+        create_params.update(optional_fields)
+
         nb_virtual_machine = _nb_api.virtualization.virtual_machines.create(**create_params)
         _index_nb_virtual_machine(_nb_objects, nb_virtual_machine)
     else:
@@ -546,6 +702,7 @@ def _process_pve_virtual_machine(
         nb_virtual_machine.custom_fields['autostart'] = pve_virtual_machine_config.get('onboot') == 1
         nb_virtual_machine.custom_fields['replicated'] = _is_replicated
         nb_virtual_machine.custom_fields['ha'] = _has_ha
+        _apply_optional_vm_fields(nb_virtual_machine, optional_fields)
         nb_virtual_machine.save()
         _index_nb_virtual_machine(_nb_objects, nb_virtual_machine)
     _process_pve_virtual_machine_network_interfaces(
@@ -900,8 +1057,11 @@ def _process_pve_virtual_machine_network_interface(
         _virtual_machine_address = primary_ipv4['address']
         _virtual_machine_address_mask = primary_ipv4['prefix']
         _virtual_machine_full_address = f'{_virtual_machine_address}/{_virtual_machine_address_mask}'
-        _prefix_network_address = '.'.join(_virtual_machine_address.split('.')[:-1]) + '.0'
-        _prefix_network_full_address = f'{_prefix_network_address}/{_virtual_machine_address_mask}'
+        # The containing network has to be computed, not assembled from text:
+        # zeroing the last octet only yields a valid prefix for /24.
+        _prefix_network_full_address = str(
+            ipaddress.ip_interface(_virtual_machine_full_address).network
+        )
 
         nb_prefix = _nb_objects['prefixes'].get(_prefix_network_full_address)
         if nb_prefix is None:
@@ -1004,18 +1164,11 @@ def _process_pve_virtual_machine_network_interface(
                 nb_ip_address.save()
                 logger.debug(f'        ✓ Updated IP {_virtual_machine_full_address} on interface {_interface_name}')
     else:
-        logger.debug(f'        Interface {_interface_name}: no IPv4 address found from guest agent')
-        if _interface_vlan_id is not None:
-            nb_vlan = _nb_objects['vlans'].get(str(_interface_vlan_id))
-            if nb_vlan is None:
-                nb_vlan = _nb_api.ipam.vlans.create(
-                    vid=_interface_vlan_id,
-                    name=f'VLAN {_interface_vlan_id}',
-                )
-                _nb_objects['vlans'][_interface_vlan_id] = nb_vlan
-
-            nb_prefix.vlan = nb_vlan.id
-            nb_prefix.save()
+        # The VLAN is attached to the prefix derived from the IPv4 address, so
+        # without one there is nothing to attach it to. This branch used to
+        # reference an unassigned ``nb_prefix`` and raise NameError.
+        logger.debug(f'        Interface {_interface_name}: no IPv4 address reported, '
+                     f'nothing to attach VLAN {_interface_vlan_id} to')
 
     return _nb_objects
 
@@ -1118,8 +1271,17 @@ def _process_pve_lxc_network_interfaces(
         _nb_objects: dict,
         _pve_container_config: dict,
         _nb_virtual_machine: any,
+        _agent_data_by_mac: dict,
 ) -> dict:
-    """Sync LXC container network interfaces (net0, net1, ...). Uses hwaddr for MAC, name= for interface name."""
+    """
+    Sync LXC container network interfaces (net0, net1, ...).
+
+    Uses hwaddr for MAC and ``name=`` for the interface name. IP addresses come
+    from ``_agent_data_by_mac``, matched by MAC exactly as for QEMU, so
+    ``PRIMARY_SUBNETS`` applies to containers as well.
+    """
+    matched_interfaces_count = 0
+
     for (_config_key, _config_value) in _pve_container_config.items():
         if not _config_key.startswith('net'):
             continue
@@ -1127,7 +1289,18 @@ def _process_pve_lxc_network_interfaces(
         network_mac_address = _network_definition.get('hwaddr')
         if network_mac_address is None:
             continue
-        interface_name = _network_definition.get('name', _config_key)
+        agent_data = _agent_data_by_mac.get(network_mac_address.lower(), {})
+        # The container config names the interface; the runtime endpoint only
+        # confirms it, so config wins and the agent name is a fallback.
+        interface_name = _network_definition.get(
+            'name', agent_data.get('interface_name', _config_key)
+        )
+        if agent_data:
+            matched_interfaces_count += 1
+            logger.debug(
+                f'      Interface {_config_key} ({network_mac_address}) → {interface_name}: '
+                f'{len(agent_data.get("ip_addresses", []))} IP(s)'
+            )
         _process_pve_virtual_machine_network_interface(
             _nb_api,
             _nb_objects,
@@ -1137,8 +1310,17 @@ def _process_pve_lxc_network_interfaces(
             network_mac_address,
             _network_definition.get('tag'),  # VLAN tag
             _network_definition.get('mtu'),  # MTU
-            {},  # LXC has no guest agent, IP addresses empty
+            agent_data,
         )
+
+    if _agent_data_by_mac:
+        logger.info(f'      Matched {matched_interfaces_count} interface(s) with LXC IP data')
+
+    _resolve_primary_ip_assignments(
+        _nb_objects,
+        _nb_virtual_machine,
+        _agent_data_by_mac,
+    )
 
     return _nb_objects
 
@@ -1276,6 +1458,8 @@ def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: List[int]) -> 
         'disks': {},
         'tags': {},
         'roles': {},
+        'platforms': {},
+        'tenants': {},
     }
     logger.debug('  - Loading devices...')
     for _nb_device in _nb_api.dcim.devices.all():
@@ -1340,6 +1524,7 @@ def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: List[int]) -> 
     for _nb_role in _nb_api.dcim.device_roles.all():
         _nb_objects['roles'][_nb_role.name] = _nb_role
         _nb_objects['roles'][str(_nb_role.id)] = _nb_role
+    _load_nb_platforms_and_tenants(_nb_api, _nb_objects)
 
     logger.info('NetBox objects loaded.')
     return _nb_objects
@@ -1361,18 +1546,28 @@ def sync_specific_vms(
     nb_objects = _load_specific_objects(_nb_api, _changed_vmids)
     _process_pve_tags(_pve_api, _nb_api, nb_objects)
     logger.info('Fetching VM metadata from Proxmox...')
-    pve_vm_tags = {}
+    pve_vm_tags: Dict[int, List[str]] = {}
+    pve_vm_pools: Dict[int, str] = {}
+    pve_template_vmids: set = set()
     for pve_vm_resource in _pve_api.cluster.resources.get(type='vm'):
         if pve_vm_resource['vmid'] in _changed_vmids:
-            pve_vm_tags[pve_vm_resource['vmid']] = []
+            _vmid = pve_vm_resource['vmid']
+            pve_vm_tags[_vmid] = []
             if 'pool' in pve_vm_resource:
-                pve_vm_tags[pve_vm_resource['vmid']].append(f'Pool/{pve_vm_resource["pool"]}')
+                pve_vm_pools[_vmid] = pve_vm_resource['pool']
+                pve_vm_tags[_vmid].append(f'Pool/{pve_vm_resource["pool"]}')
+            if pve_vm_resource.get('template'):
+                pve_template_vmids.add(_vmid)
+                if _cfg().template_policy == 'tag':
+                    _ensure_nb_tag(TEMPLATE_TAG_NAME, _nb_api, nb_objects)
+                    pve_vm_tags[_vmid].append(TEMPLATE_TAG_NAME)
             if _cfg().sync_tags and 'tags' in pve_vm_resource:
                 for _raw_tag in pve_vm_resource['tags'].split(';'):
                     _tag_name = _raw_tag.strip()
                     if _tag_name:
                         _ensure_nb_tag(_tag_name, _nb_api, nb_objects)
-                        pve_vm_tags[pve_vm_resource['vmid']].append(_tag_name)
+                        pve_vm_tags[_vmid].append(_tag_name)
+    skip_templates = _cfg().template_policy == 'skip'
     
     pve_ha_virtual_machine_ids = list(
         map(
@@ -1420,6 +1615,9 @@ def sync_specific_vms(
             if shutdown.should_stop():
                 logger.warning('Quick sync interrupted by shutdown request')
                 return
+            if skip_templates and vm['vmid'] in pve_template_vmids:
+                logger.info(f'    Skipping template VM: {vm["name"]} (ID: {vm["vmid"]})')
+                continue
             logger.info(f'    Quick sync VM: {vm["name"]} (ID: {vm["vmid"]})')
             try:
                 _process_pve_virtual_machine(
@@ -1431,6 +1629,7 @@ def sync_specific_vms(
                     vm,
                     vm['vmid'] in pve_replicated_virtual_machine_ids,
                     vm['vmid'] in pve_ha_virtual_machine_ids,
+                    pve_vm_pools.get(vm['vmid']),
                 )
             except Exception as e:
                 sync_errors += 1
@@ -1442,6 +1641,9 @@ def sync_specific_vms(
             if shutdown.should_stop():
                 logger.warning('Quick sync interrupted by shutdown request')
                 return
+            if skip_templates and ct['vmid'] in pve_template_vmids:
+                logger.info(f'    Skipping template LXC: {ct["name"]} (ID: {ct["vmid"]})')
+                continue
             logger.info(f'    Quick sync LXC: {ct["name"]} (ID: {ct["vmid"]})')
             try:
                 _process_pve_lxc_container(
@@ -1453,6 +1655,7 @@ def sync_specific_vms(
                     ct,
                     ct['vmid'] in pve_replicated_virtual_machine_ids,
                     ct['vmid'] in pve_ha_virtual_machine_ids,
+                    pve_vm_pools.get(ct['vmid']),
                 )
             except Exception as e:
                 sync_errors += 1
@@ -1560,19 +1763,36 @@ def main(
         nb_objects,
     )
     logger.info('Fetching VM tags from Proxmox...')
-    pve_vm_tags = {}
+    pve_vm_tags: Dict[int, List[str]] = {}
+    pve_vm_pools: Dict[int, str] = {}
+    pve_template_vmids: set = set()
     for pve_vm_resource in pve_api.cluster.resources.get(type='vm'):
-        pve_vm_tags[pve_vm_resource['vmid']] = []
+        _vmid = pve_vm_resource['vmid']
+        pve_vm_tags[_vmid] = []
 
         if 'pool' in pve_vm_resource:
-            pve_vm_tags[pve_vm_resource['vmid']].append(f'Pool/{pve_vm_resource["pool"]}')
+            pve_vm_pools[_vmid] = pve_vm_resource['pool']
+            pve_vm_tags[_vmid].append(f'Pool/{pve_vm_resource["pool"]}')
+
+        if pve_vm_resource.get('template'):
+            pve_template_vmids.add(_vmid)
+            if config.template_policy == 'tag':
+                _ensure_nb_tag(TEMPLATE_TAG_NAME, nb_api, nb_objects)
+                pve_vm_tags[_vmid].append(TEMPLATE_TAG_NAME)
 
         if config.sync_tags and 'tags' in pve_vm_resource:
             for _raw_tag in pve_vm_resource['tags'].split(';'):
                 _tag_name = _raw_tag.strip()
                 if _tag_name:
                     _ensure_nb_tag(_tag_name, nb_api, nb_objects)
-                    pve_vm_tags[pve_vm_resource['vmid']].append(_tag_name)
+                    pve_vm_tags[_vmid].append(_tag_name)
+
+    skip_templates = config.template_policy == 'skip'
+    template_count = len(pve_template_vmids)
+    if template_count and skip_templates:
+        # Templates stay out of current_vmids, so ENABLE_CLEANUP removes the ones
+        # a previous run created.
+        logger.info(f'Skipping {template_count} template(s) (TEMPLATE_POLICY=skip)')
 
     pve_ha_virtual_machine_ids = list(
         map(
@@ -1615,6 +1835,12 @@ def main(
                 if shutdown.should_stop():
                     interrupted = True
                     break
+                if skip_templates and pve_virtual_machine['vmid'] in pve_template_vmids:
+                    logger.debug(
+                        f'    Skipping template VM: {pve_virtual_machine["name"]} '
+                        f'(ID: {pve_virtual_machine["vmid"]})'
+                    )
+                    continue
                 logger.info(f'    Processing VM: {pve_virtual_machine["name"]} (ID: {pve_virtual_machine["vmid"]})')
                 current_vmids.add(pve_virtual_machine["vmid"])
                 vm_count += 1
@@ -1629,6 +1855,7 @@ def main(
                         pve_virtual_machine,
                         pve_virtual_machine['vmid'] in pve_replicated_virtual_machine_ids,
                         pve_virtual_machine['vmid'] in pve_ha_virtual_machine_ids,
+                        pve_vm_pools.get(pve_virtual_machine['vmid']),
                     )
                 except Exception as e:
                     sync_errors += 1
@@ -1644,6 +1871,12 @@ def main(
                 if shutdown.should_stop():
                     interrupted = True
                     break
+                if skip_templates and pve_container['vmid'] in pve_template_vmids:
+                    logger.debug(
+                        f'    Skipping template LXC: {pve_container["name"]} '
+                        f'(ID: {pve_container["vmid"]})'
+                    )
+                    continue
                 logger.info(f'    Processing LXC: {pve_container["name"]} (ID: {pve_container["vmid"]})')
                 current_vmids.add(pve_container["vmid"])
                 lxc_count += 1
@@ -1658,6 +1891,7 @@ def main(
                         pve_container,
                         pve_container['vmid'] in pve_replicated_virtual_machine_ids,
                         pve_container['vmid'] in pve_ha_virtual_machine_ids,
+                        pve_vm_pools.get(pve_container['vmid']),
                     )
                 except Exception as e:
                     sync_errors += 1

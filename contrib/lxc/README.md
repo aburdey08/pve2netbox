@@ -11,7 +11,10 @@ The **`deploy-from-pve.sh`** script creates a Debian 12 LXC, starts it, and inst
 Run **on a Proxmox VE node as root**:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/deploy-from-pve.sh -o deploy-from-pve.sh
+# Testing a specific branch instead of master? export REPO_BRANCH=your-branch first.
+export REPO_BRANCH="${REPO_BRANCH:-master}"
+
+curl -sL "https://raw.githubusercontent.com/aburdey08/pve2netbox/$REPO_BRANCH/contrib/lxc/deploy-from-pve.sh" -o deploy-from-pve.sh
 chmod +x deploy-from-pve.sh
 ./deploy-from-pve.sh
 ```
@@ -25,9 +28,11 @@ If a **`.env`** file sits **next to** `deploy-from-pve.sh`, the script copies it
 Recommended flow:
 
 ```bash
+export REPO_BRANCH="${REPO_BRANCH:-master}"   # set to test another branch
+
 # 1. Get the mode sample (Combined — recommended) and the deploy script:
-curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/env.combined-mode -o .env
-curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/deploy-from-pve.sh -o deploy-from-pve.sh
+curl -sL "https://raw.githubusercontent.com/aburdey08/pve2netbox/$REPO_BRANCH/contrib/lxc/env.combined-mode" -o .env
+curl -sL "https://raw.githubusercontent.com/aburdey08/pve2netbox/$REPO_BRANCH/contrib/lxc/deploy-from-pve.sh" -o deploy-from-pve.sh
 chmod +x deploy-from-pve.sh
 
 # 2. Fill in PVE_API_* and NB_API_* in .env:
@@ -59,15 +64,16 @@ pct exec <CTID> -- journalctl -u pve2netbox -f
 
 ### Script parameters
 
-Passed as environment variables: `CTID`, `STORAGE`, `BRIDGE`, `LXC_HOSTNAME`, `ROOTFS_SIZE`, `MEMORY`, `TEMPLATE_STORAGE`.
+Passed as environment variables: `CTID`, `STORAGE`, `BRIDGE`, `LXC_HOSTNAME`, `ROOTFS_SIZE`, `MEMORY`, `TEMPLATE_STORAGE`, `REPO_BRANCH`, `REPO_RAW`, `REPO_GIT`.
 
-Defaults: `CTID` — first free starting at 200, `BRIDGE` — `vmbr0`, `HOSTNAME` — `lxc-pve2netbox`, `ROOTFS_SIZE` — 2 GiB, `MEMORY` — 256 MiB.
+Defaults: `CTID` — first free starting at 200, `BRIDGE` — `vmbr0`, `HOSTNAME` — `lxc-pve2netbox`, `ROOTFS_SIZE` — 2 GiB, `MEMORY` — 256 MiB, `REPO_BRANCH` — `master`.
 
 Examples:
 
 ```bash
 CTID=201 BRIDGE=vmbr1 ./deploy-from-pve.sh
 ./deploy-from-pve.sh --no-install   # create LXC only, skip app install
+REPO_BRANCH=my-feature-branch ./deploy-from-pve.sh   # test a specific branch
 ```
 
 ---
@@ -94,9 +100,12 @@ Enter the container with `pct enter <CTID>` (or `pct exec <CTID> -- ...`), then:
 
 ```bash
 curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/master/contrib/lxc/install.sh | bash
+# testing a branch: REPO_BRANCH=your-branch curl -sL https://raw.githubusercontent.com/aburdey08/pve2netbox/your-branch/contrib/lxc/install.sh | bash
 ```
 
 The script installs dependencies, the package, and systemd units. On first run it seeds `/etc/pve2netbox/env` from `.env.example` (existing file is kept untouched).
+
+`install.sh` itself honors `REPO_BRANCH` (default `master`), `REPO_RAW`, and `REPO_GIT` — the `curl` URL above must already point at the branch you want, since it downloads the script before `install.sh` gets a chance to read the variable.
 
 Edit config and enable:
 
