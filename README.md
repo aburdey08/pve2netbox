@@ -144,10 +144,17 @@ holds for `SYNC_VMS=false` / `SYNC_LXC=false`, which used to make cleanup delete
 container of the disabled type.
 
 Filters apply to the full sync, the quick check and cleanup alike. `SYNC_POOLS` is the one
-exception: pool membership is only visible through `/cluster/resources`. Where that endpoint is
-merely slow, a pool move is picked up by the full sync rather than by the quick check. Where the
-API token cannot read it at all, `SYNC_POOLS` cannot be honoured by anything and the sync stops
-with a configuration error instead of quietly matching no guest.
+exception: pool membership needs `/cluster/resources`, the only endpoint that answers it in a
+single request. Where the API token cannot read it, the full sync rebuilds pool membership from
+`/pools` — a separate permission — and carries on; the quick check does not, so a pool move is
+then picked up by the next full sync rather than within the quick-check interval. Only when
+neither endpoint is readable does the sync stop with a configuration error instead of quietly
+matching no guest.
+
+Reading pools matters beyond `SYNC_POOLS`: tags are written to NetBox wholesale, so a pass that
+cannot see pools would strip the `Pool/*` tag off every guest it touches. If that ever happens
+you get a warning naming the consequence, and the tag comes back on the next pass that can read
+pools.
 
 ---
 

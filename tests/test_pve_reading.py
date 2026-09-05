@@ -7,7 +7,12 @@ import types
 
 import pytest
 
-from pve2netbox import _collect_pve_guest_metadata, _read_pve_guests, _select_pve_nodes
+from pve2netbox import (
+    _collect_pve_guest_metadata,
+    _read_pve_guests,
+    _read_pve_pool_members,
+    _select_pve_nodes,
+)
 from pve2netbox.api.proxmox import (
     QUICK_CHECK_SOURCE_CLUSTER,
     QUICK_CHECK_SOURCE_NODES,
@@ -57,11 +62,51 @@ class FakeResources:
         return list(self.resources)
 
 
+class FakePoolDetail:
+    """One GET /pools/<id> answer."""
+
+    def __init__(self, payload, error=None):
+        self.payload = payload
+        self.error = error
+
+    def get(self):
+        if self.error is not None:
+            raise self.error
+        return self.payload
+
+
+class FakePools:
+    """
+    The /pools endpoint. Left off a FakeProxmox entirely to model a token that
+    cannot reach it at all.
+    """
+
+    def __init__(self, members_by_pool, list_error=None, member_errors=(), as_list=False):
+        self.members_by_pool = members_by_pool
+        self.list_error = list_error
+        self.member_errors = set(member_errors)
+        self.as_list = as_list
+
+    def get(self):
+        if self.list_error is not None:
+            raise self.list_error
+        return [{'poolid': poolid} for poolid in self.members_by_pool]
+
+    def __call__(self, poolid):
+        members = [{'vmid': vmid, 'type': 'qemu'} for vmid in self.members_by_pool[poolid]]
+        # PVE 7 answers GET /pools/<id> with one object, PVE 8 with a list of one.
+        payload = [{'members': members}] if self.as_list else {'members': members}
+        error = RuntimeError('403') if poolid in self.member_errors else None
+        return FakePoolDetail(payload, error)
+
+
 class FakeProxmox:
-    def __init__(self, guests_by_node, resources=None, resources_error=None):
+    def __init__(self, guests_by_node, resources=None, resources_error=None, pools=None):
         self.nodes = FakeNodes(guests_by_node)
         self.cluster = types.SimpleNamespace(
             resources=FakeResources(resources or [], resources_error))
+        if pools is not None:
+            self.pools = pools
 
 
 GUESTS_BY_NODE = {
@@ -96,6 +141,76 @@ class TestReadPveGuests:
         pve = FakeProxmox(GUESTS_BY_NODE, resources_error=RuntimeError('403'))
         guests, _ = _read_pve_guests(pve)
         assert {g.node for g, _ in guests} == {'pve1', 'pve9'}
+
+
+PROD_POOL = {'prod': [100]}
+
+
+def fallback(pools=None):
+    """A Proxmox whose /cluster/resources is out of reach."""
+    return FakeProxmox(GUESTS_BY_NODE, resources_error=RuntimeError('403'), pools=pools)
+
+
+class TestReadPvePoolMembers:
+    def test_maps_vmids_to_their_pool(self):
+        assert _read_pve_pool_members(fallback(FakePools(PROD_POOL))) == {100: 'prod'}
+
+    def test_accepts_the_pve8_list_shape(self):
+        pools = FakePools(PROD_POOL, as_list=True)
+        assert _read_pve_pool_members(fallback(pools)) == {100: 'prod'}
+
+    def test_an_unlistable_endpoint_gives_up(self):
+        pools = FakePools(PROD_POOL, list_error=RuntimeError('403'))
+        assert _read_pve_pool_members(fallback(pools)) is None
+
+    def test_one_unreadable_pool_discards_the_whole_map(self):
+        # A partial map is worse than none: the guests of the pool that could
+        # not be read would look pool-less and lose their Pool/* tag.
+        pools = FakePools({'prod': [100], 'dmz': [900]}, member_errors=('dmz',))
+        assert _read_pve_pool_members(fallback(pools)) is None
+
+    def test_no_pools_endpoint_at_all(self):
+        assert _read_pve_pool_members(fallback()) is None
+
+
+class TestPoolFallback:
+    """
+    Tags are written wholesale (``nb_vm.tags = [...]``), so a pass that cannot
+    see pools strips ``Pool/*`` off every guest it touches. /pools is a second
+    source of the same fact and a separate PVE permission.
+    """
+
+    def test_pools_are_rebuilt_from_the_pools_endpoint(self, caplog):
+        with caplog.at_level('INFO'):
+            guests, pools_known = _read_pve_guests(fallback(FakePools(PROD_POOL)))
+        assert pools_known
+        assert {g.vmid: g.pool for g, _ in guests} == {100: 'prod', 900: None}
+        assert 'rebuilt from /pools' in caplog.text
+
+    def test_the_pool_tag_survives_the_fallback(self, config):
+        config(sync_tags=False, template_policy='sync')
+        decisions = FilterDecisions(GuestFilters())
+        tags, pools, _ = _collect_pve_guest_metadata(
+            fallback(FakePools(PROD_POOL)), None, {}, decisions)
+        assert pools == {100: 'prod'}
+        assert tags[100] == ['Pool/prod']
+
+    def test_sync_pools_is_honoured_on_the_fallback_path(self, config):
+        config(sync_tags=False, template_policy='sync', sync_pools=('prod',))
+        decisions = FilterDecisions(GuestFilters(sync_pools=frozenset({'prod'})))
+        tags, _, _ = _collect_pve_guest_metadata(
+            fallback(FakePools(PROD_POOL)), None, {}, decisions)
+        assert set(tags) == {100}
+        assert decisions.excluded_vmids == {900}
+
+    def test_losing_both_sources_warns_about_the_tags(self, config, caplog):
+        config(sync_tags=False, template_policy='sync')
+        decisions = FilterDecisions(GuestFilters())
+        with caplog.at_level('WARNING'):
+            tags, pools, _ = _collect_pve_guest_metadata(fallback(), None, {}, decisions)
+        assert pools == {}
+        assert tags[100] == []
+        assert 'lose their' in caplog.text
 
 
 class TestCollectMetadata:

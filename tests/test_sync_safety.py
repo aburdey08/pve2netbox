@@ -16,7 +16,9 @@ from pve2netbox import (
     _fetch_filtered,
     _fetch_for_vms,
     _is_filter_rejected,
+    _load_nb_devices,
     _mark_incomplete_preload,
+    _names_all_present,
     _nb_vm_in_cluster,
     _preload_incomplete,
     cleanup_stale_vms,
@@ -120,6 +122,129 @@ class TestFetchFiltered:
         endpoint = FakeEndpoint(fail_on=lambda p: True, error=http_error(400))
         with pytest.raises(Exception):
             _fetch_filtered(endpoint, 'devices', [{'name': ['a']}])
+
+
+class TestFetchFilteredCoverage:
+    """
+    An answer NetBox gives without honouring the filter in full. It raises
+    nothing, so only the answer itself can give it away.
+    """
+
+    def test_an_answer_that_does_not_cover_is_widened(self):
+        endpoint = FakeEndpoint(records=[fake_iface(1), fake_iface(2)])
+        records = _fetch_filtered(
+            endpoint, 'ifaces', [{'name': ['a']}, {}], _covers=lambda found: len(found) > 5)
+        assert len(records) == 2
+        assert endpoint.calls == [{'name': ['a']}, {}]
+
+    def test_an_answer_that_covers_is_kept(self):
+        endpoint = FakeEndpoint(records=[fake_iface(1)])
+        _fetch_filtered(endpoint, 'ifaces', [{'name': ['a']}, {}], _covers=lambda found: True)
+        assert endpoint.calls == [{'name': ['a']}]
+
+    def test_the_last_parameter_set_is_accepted_as_it_is(self):
+        # Nothing wider is left, so an unsatisfying answer is still the answer.
+        endpoint = FakeEndpoint(records=[fake_iface(1)])
+        records = _fetch_filtered(endpoint, 'ifaces', [{}], _covers=lambda found: False)
+        assert len(records) == 1
+
+
+class FakeDevices:
+    """A dcim.devices endpoint that honours only the lookups it is told to."""
+
+    def __init__(self, names, honours=('name__ie', 'name'), narrow=False):
+        self.devices = [types.SimpleNamespace(name=name) for name in names]
+        self.honours = honours
+        self.narrow = narrow
+        self.calls = []
+
+    def filter(self, **params):
+        self.calls.append(params)
+        (key, wanted), = params.items()
+        if key not in self.honours:
+            raise http_error(400)
+        if self.narrow:
+            # What some NetBox versions do with a multi-value filter.
+            wanted = wanted[-1:]
+        if key == 'name__ie':
+            folded = {value.lower() for value in wanted}
+            return [d for d in self.devices if d.name.lower() in folded]
+        return [d for d in self.devices if d.name in set(wanted)]
+
+    def all(self):
+        self.calls.append({})
+        return list(self.devices)
+
+
+def load_devices(devices, node_names, scoped=True):
+    """Run _load_nb_devices against a fake endpoint; returns the device cache."""
+    nb_objects = _empty_nb_objects()
+    nb_api = types.SimpleNamespace(dcim=types.SimpleNamespace(devices=devices))
+    _load_nb_devices(nb_api, nb_objects, node_names, scoped)
+    return nb_objects['devices']
+
+
+class TestNamesAllPresent:
+    def test_case_folded_comparison(self):
+        covers = _names_all_present(['PVE1', 'pve2'])
+        assert covers([types.SimpleNamespace(name='pve1'), types.SimpleNamespace(name='PVE2')])
+
+    def test_a_missing_name_is_not_covered(self):
+        assert not _names_all_present(['pve1', 'pve2'])([types.SimpleNamespace(name='pve1')])
+
+    def test_a_nameless_record_does_not_crash(self):
+        assert not _names_all_present(['pve1'])([types.SimpleNamespace(name=None)])
+
+
+class TestLoadNbDevices:
+    """
+    A node whose device is missing from the cache reads as "no such device in
+    NetBox": the node is skipped (or the process exits), and a skipped node's
+    guests never reach current_vmids, so ENABLE_CLEANUP deletes them. A scoped
+    query that answers short has to be widened, not believed.
+    """
+
+    def test_case_insensitive_filter_is_enough_on_its_own(self):
+        devices = FakeDevices(['PVE1'])
+        assert set(load_devices(devices, ['pve1'])) == {'pve1'}
+        assert devices.calls == [{'name__ie': ['pve1']}]
+
+    def test_case_sensitive_fallback_missing_a_device_is_widened(self):
+        # NetBox too old for name__ie, and the device is spelled differently
+        # from the Proxmox node. The narrow query answers nothing, without error.
+        devices = FakeDevices(['PVE1'], honours=('name',))
+        assert set(load_devices(devices, ['pve1'])) == {'pve1'}
+        assert devices.calls == [{'name__ie': ['pve1']}, {'name': ['pve1']}, {}]
+
+    def test_multi_value_filter_narrowed_to_one_value_is_widened(self):
+        devices = FakeDevices(['pve1', 'pve2'], narrow=True)
+        assert set(load_devices(devices, ['pve1', 'pve2'])) == {'pve1', 'pve2'}
+        assert devices.calls[-1] == {}
+
+    def test_a_node_that_really_has_no_device_widens_once_and_stops(self):
+        # Widening cannot invent the device; it just proves it is absent.
+        devices = FakeDevices(['pve1'])
+        assert set(load_devices(devices, ['pve1', 'pve404'])) == {'pve1'}
+        assert devices.calls == [
+            {'name__ie': ['pve1', 'pve404']},
+            {'name': ['pve1', 'pve404']},
+            {},
+        ]
+
+    def test_a_complete_answer_costs_one_request(self):
+        devices = FakeDevices(['pve1', 'pve2'])
+        assert set(load_devices(devices, ['pve1', 'pve2'])) == {'pve1', 'pve2'}
+        assert len(devices.calls) == 1
+
+    def test_no_nodes_in_scope_asks_nothing(self):
+        devices = FakeDevices(['pve1'])
+        assert load_devices(devices, []) == {}
+        assert devices.calls == []
+
+    def test_unscoped_reads_everything(self):
+        devices = FakeDevices(['pve1', 'pve2'])
+        assert set(load_devices(devices, ['pve1'], scoped=False)) == {'pve1', 'pve2'}
+        assert devices.calls == [{}]
 
 
 class TestFetchForVms:

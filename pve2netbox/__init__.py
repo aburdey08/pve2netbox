@@ -8,7 +8,7 @@ import ipaddress
 import re
 import sys
 import time
-from typing import Optional, Dict, List, Set, Tuple, Any
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import pynetbox
 import requests
@@ -217,25 +217,46 @@ def _is_filter_rejected(_error: Exception) -> bool:
     return status == 400
 
 
-def _fetch_filtered(_endpoint: Any, _label: str, _param_sets: List[dict]) -> List[Any]:
+def _fetch_filtered(
+        _endpoint: Any,
+        _label: str,
+        _param_sets: List[dict],
+        _covers: Optional[Callable[[List[Any]], bool]] = None,
+) -> List[Any]:
     """
     Read a NetBox endpoint, trying each parameter set until one is accepted.
 
     Which filters exist differs between NetBox versions, so a rejected one
     falls back to the next; the caller ends the list with ``{}`` ("load
     everything") — slower, always correct. Any other failure is raised.
+
+    ``_covers`` catches what a rejection cannot report: a filter NetBox answers
+    without honouring it in full — a multi-value query narrowed to its last
+    value, or a case-sensitive one missing a differently spelled name. An
+    answer it turns down is widened exactly like a rejected query. The last
+    parameter set is accepted whatever it returns; there is nothing wider left.
     """
+    last = len(_param_sets) - 1
     for index, params in enumerate(_param_sets):
         try:
             records = list(_endpoint.filter(**params) if params else _endpoint.all())
-            logger.debug(f'  - Loaded {len(records)} {_label} ({params or "unfiltered"})')
-            return records
         except Exception as e:  # pylint: disable=broad-except
-            if index == len(_param_sets) - 1 or not _is_filter_rejected(e):
+            if index == last or not _is_filter_rejected(e):
                 raise
             logger.warning(
                 f'  NetBox rejected {list(params)} for {_label} ({e}); trying a wider query'
             )
+            continue
+
+        if index < last and _covers is not None and not _covers(records):
+            logger.warning(
+                f'  NetBox answered {list(params)} for {_label} with {len(records)} record(s), '
+                f'which do not cover what was asked for; trying a wider query'
+            )
+            continue
+
+        logger.debug(f'  - Loaded {len(records)} {_label} ({params or "unfiltered"})')
+        return records
     return []
 
 
@@ -391,6 +412,24 @@ def _load_nb_shared_objects(_nb_api: pynetbox.api, _nb_objects: dict) -> Dict[st
     return counts
 
 
+def _names_all_present(_wanted: List[str]) -> Callable[[List[Any]], bool]:
+    """
+    Build a :func:`_fetch_filtered` check: every wanted name is among the answer.
+
+    Case-folded, because that is how the device cache is keyed and looked up.
+    """
+    wanted = {name.lower() for name in _wanted}
+
+    def _covers(records: List[Any]) -> bool:
+        found = {(getattr(record, 'name', '') or '').lower() for record in records}
+        missing = wanted - found
+        if missing:
+            logger.debug(f'  - Not named in the answer: {", ".join(sorted(missing))}')
+        return not missing
+
+    return _covers
+
+
 def _load_nb_devices(
         _nb_api: pynetbox.api,
         _nb_objects: dict,
@@ -403,6 +442,13 @@ def _load_nb_devices(
     Scoped: only devices named like a Proxmox node, matched case-insensitively
     (``name__ie``) as the later lookup is, with a case-sensitive query and an
     unfiltered read as fallbacks for older NetBox versions.
+
+    A scoped answer that does not name every node is widened rather than
+    trusted. A node whose device is missing from the cache is read as "no such
+    device in NetBox", which stops the whole node (``NODE_MISSING_POLICY=skip``)
+    or the process (``fail``) — and a skipped node's guests never reach
+    ``current_vmids``, so ``ENABLE_CLEANUP=true`` would delete them. Widening
+    costs one broader read; the alternative costs records.
     """
     if _scoped:
         if not _node_names:
@@ -413,6 +459,7 @@ def _load_nb_devices(
             _nb_api.dcim.devices,
             'devices',
             [{'name__ie': _node_names}, {'name': _node_names}, {}],
+            _covers=_names_all_present(_node_names),
         )
     else:
         devices = _fetch_all(_nb_api.dcim.devices, 'devices')
@@ -1690,33 +1737,79 @@ def _select_pve_nodes(
     return nodes
 
 
+def _read_pve_pool_members(_pve_api: ProxmoxAPI) -> Optional[Dict[int, str]]:
+    """
+    Map VMID to pool name by reading ``/pools``, or ``None`` when that fails.
+
+    The second source of pool membership, used when ``/cluster/resources`` is
+    out of reach. It is a separate permission and a separate endpoint —
+    :func:`_process_pve_tags` already reads it — so a token that cannot see the
+    cluster-wide resource list can still very well see the pools.
+
+    Partial answers are refused: one unreadable pool would make its guests look
+    pool-less, and a guest that looks pool-less loses its ``Pool/*`` tag.
+    """
+    try:
+        pve_pools = _pve_api.pools.get()
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(f'/pools is not available either ({e})')
+        return None
+
+    members: Dict[int, str] = {}
+    for pve_pool in pve_pools:
+        poolid = pve_pool.get('poolid')
+        if not poolid:
+            continue
+        try:
+            detail = _pve_api.pools(poolid).get()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f'Failed to read the members of Proxmox pool "{poolid}" ({e})')
+            return None
+        # PVE 7 answers GET /pools/<id> with one object; PVE 8 with a list of one.
+        for entry in (detail if isinstance(detail, list) else [detail]):
+            for member in entry.get('members') or []:
+                vmid = member.get('vmid')
+                if vmid is not None:
+                    members[int(vmid)] = poolid
+    return members
+
+
 def _read_pve_guests(_pve_api: ProxmoxAPI) -> Tuple[List[Tuple[Guest, dict]], bool]:
     """
     Read every guest in the cluster with its raw entry; returns ``(guests, pools_known)``.
 
-    ``/cluster/resources`` is the only endpoint that knows a guest's pool and
-    the only one that sees guests on nodes this sync skips — which is what
+    ``/cluster/resources`` is the only endpoint that answers this in one request
+    and the only one that sees guests on nodes this sync skips — which is what
     protects excluded guests from cleanup. The fallback walks every node,
-    filtered-out ones included, so that protection survives without pools.
+    filtered-out ones included, so that protection survives, and rebuilds pool
+    membership from ``/pools``: the sync assigns tags wholesale, so a pass that
+    cannot see pools would strip ``Pool/*`` off every guest it touches.
     """
     try:
         resources = _pve_api.cluster.resources.get(type='vm')
     except Exception as e:  # pylint: disable=broad-except
         logger.warning(
-            f'/cluster/resources is not available ({e}); falling back to per-node listings. '
-            f'Pools are invisible on this path.'
+            f'/cluster/resources is not available ({e}); falling back to per-node listings.'
         )
-        return _read_pve_guests_from_nodes(_pve_api), False
+        pool_members = _read_pve_pool_members(_pve_api)
+        if pool_members is None:
+            return _read_pve_guests_from_nodes(_pve_api, {}), False
+        logger.info(f'Pool membership rebuilt from /pools for {len(pool_members)} guest(s)')
+        return _read_pve_guests_from_nodes(_pve_api, pool_members), True
 
     return [(Guest.from_cluster_resource(r), r) for r in resources], True
 
 
-def _read_pve_guests_from_nodes(_pve_api: ProxmoxAPI) -> List[Tuple[Guest, dict]]:
+def _read_pve_guests_from_nodes(
+        _pve_api: ProxmoxAPI,
+        _pool_members: Dict[int, str],
+) -> List[Tuple[Guest, dict]]:
     """
     Read every guest by walking all nodes — the fallback for :func:`_read_pve_guests`.
 
     Ignores the node filters on purpose: a guest on a skipped node still has to
-    be evaluated so cleanup knows not to delete it.
+    be evaluated so cleanup knows not to delete it. Pools come from
+    ``_pool_members``, since a per-node listing does not carry them.
     """
     guests: List[Tuple[Guest, dict]] = []
     for pve_node in _pve_api.nodes.get():
@@ -1728,7 +1821,8 @@ def _read_pve_guests_from_nodes(_pve_api: ProxmoxAPI) -> List[Tuple[Guest, dict]
                 logger.warning(f'Failed to list {kind} guests on node {node_name}: {e}')
                 continue
             for entry in entries:
-                guests.append((Guest.from_node_entry(entry, node_name, kind), entry))
+                pool = _pool_members.get(int(entry['vmid']))
+                guests.append((Guest.from_node_entry(entry, node_name, kind, pool), entry))
     return guests
 
 
@@ -1760,10 +1854,14 @@ def _collect_pve_guest_metadata(
     if not pools_known:
         if config.sync_pools:
             raise RuntimeError(
-                'SYNC_POOLS is set but /cluster/resources is unavailable, so no guest can be '
-                'matched to a pool. Grant the API token cluster-wide read permission or unset '
-                'SYNC_POOLS.'
+                'SYNC_POOLS is set but neither /cluster/resources nor /pools can be read, so no '
+                'guest can be matched to a pool. Grant the API token read permission on one of '
+                'them, or unset SYNC_POOLS.'
             )
+        logger.warning(
+            'Pool membership is unreadable this pass; the guests synced now lose their '
+            'Pool/* tag in NetBox until pools can be read again.'
+        )
         if config.pool_as_tenant:
             logger.warning(
                 'POOL_AS_TENANT is set but pools are unreadable on this path; '
