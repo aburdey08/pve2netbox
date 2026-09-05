@@ -20,6 +20,10 @@ node, and a full sync that no longer reads all of NetBox into memory.
   Each sync logs `Filters excluded 12 of 340 guest(s) (EXCLUDE_TAGS: 8, EXCLUDE_VMIDS: 4)` and
   exports the count as **`pve2netbox_guests_filtered`**.
 - **`NB_PRELOAD_SCOPE`** (`cluster` | `all`, default `cluster`) — see below.
+- **Test suite.** 103 pytest cases covering the filter rules, config parsing, the guards
+  around NetBox reads and the cleanup safety checks; no live Proxmox or NetBox is needed.
+  `pip install -e '.[dev]' && pytest`. GitHub Actions runs them on Python 3.9–3.13 for every
+  push and pull request.
 
 ### Changed
 

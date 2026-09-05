@@ -1,6 +1,7 @@
 # pve2netbox
 
 [![Docker Hub](https://img.shields.io/badge/Docker%20Hub-0db7ed?logo=docker&logoColor=white)](https://hub.docker.com/r/aburdey/pve2netbox)
+[![tests](https://github.com/aburdey08/pve2netbox/actions/workflows/tests.yml/badge.svg)](https://github.com/aburdey08/pve2netbox/actions/workflows/tests.yml)
 
 Sync Proxmox VE (PVE) inventory to NetBox: QEMU VMs and LXC containers, their disks, network interfaces, IP addresses and tags.
 
