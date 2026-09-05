@@ -21,8 +21,10 @@ from pve2netbox import (
     _names_all_present,
     _nb_vm_in_cluster,
     _preload_incomplete,
+    _spare_guests_of_skipped_node,
     cleanup_stale_vms,
 )
+from pve2netbox.filters import FilterDecisions, Guest, GuestFilters, QEMU
 
 
 def http_error(status):
@@ -384,3 +386,53 @@ class TestCleanupStaleVms:
         odd = fake_vm(3, 'not-a-vmid')
         cleanup_stale_vms(None, self._objects([odd]), set())
         assert odd.deleted == []
+
+
+class TestSpareGuestsOfSkippedNode:
+    """
+    A node with no device in NetBox is skipped, and its guests are never synced.
+    They are still running, so cleanup must not read the skip as "gone" — that
+    would turn a naming mistake into deleted records.
+    """
+
+    @staticmethod
+    def _decisions(*guests):
+        decisions = FilterDecisions(GuestFilters())
+        for vmid, node in guests:
+            decisions.is_excluded(
+                Guest(vmid=vmid, node=node, name=f'vm{vmid}', kind=QEMU))
+        return decisions
+
+    def test_the_skipped_nodes_guests_count_as_present(self):
+        decisions = self._decisions((100, 'pve1'), (101, 'pve1'), (200, 'pve2'))
+        current = {200}
+        assert _spare_guests_of_skipped_node(decisions, 'pve1', current, set()) == 2
+        assert current == {100, 101, 200}
+
+    def test_cleanup_then_leaves_them_alone(self, config):
+        # The whole point: the guests of a node without a NetBox device survive
+        # a pass with ENABLE_CLEANUP=true.
+        config()
+        decisions = self._decisions((100, 'pve1'))
+        stranded = fake_vm(1, 100)
+        nb_objects = _empty_nb_objects()
+        nb_objects['virtual_machines'][stranded.serial] = stranded
+
+        current = set()
+        _spare_guests_of_skipped_node(decisions, 'pve1', current, set())
+        cleanup_stale_vms(None, nb_objects, current)
+        assert stranded.deleted == []
+
+    def test_templates_are_still_dropped_when_asked(self):
+        # TEMPLATE_POLICY=skip means templates do not belong in NetBox at all,
+        # whichever node they sit on.
+        decisions = self._decisions((100, 'pve1'), (900, 'pve1'))
+        current = set()
+        assert _spare_guests_of_skipped_node(decisions, 'pve1', current, {900}) == 1
+        assert current == {100}
+
+    def test_an_unknown_node_spares_nothing(self):
+        decisions = self._decisions((100, 'pve1'))
+        current = set()
+        assert _spare_guests_of_skipped_node(decisions, 'pve9', current, set()) == 0
+        assert current == set()

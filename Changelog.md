@@ -7,8 +7,8 @@ node, and a full sync that no longer reads all of NetBox into memory.
 
 ### Added
 
-- **Selection filters.** Comma- or space-separated, case-insensitive; a guest must pass all of
-  them. Filtered guests are never deleted by `ENABLE_CLEANUP` — they still exist in Proxmox.
+- **Selection filters** — comma- or space-separated, case-insensitive; a guest must pass all of
+  them, and filtered guests are never deleted by `ENABLE_CLEANUP`.
 
   | Variable | Meaning |
   |----------|---------|
@@ -18,62 +18,53 @@ node, and a full sync that no longer reads all of NetBox into memory.
   | `EXCLUDE_VMIDS` | Single IDs and ranges: `100,105,900-999` |
 
   Each sync logs `Filters excluded 12 of 340 guest(s) (EXCLUDE_TAGS: 8, EXCLUDE_VMIDS: 4)` and
-  exports the count as **`pve2netbox_guests_filtered`**.
-- **`NB_PRELOAD_SCOPE`** (`cluster` | `all`, default `cluster`) — see below.
-- **Test suite.** 125 pytest cases covering the filter rules, config parsing, the guards
-  around NetBox reads and the cleanup safety checks; no live Proxmox or NetBox is needed.
-  `pip install -e '.[dev]' && pytest`. GitHub Actions runs them on Python 3.9–3.13 for every
-  push and pull request.
+  exports the count as `pve2netbox_guests_filtered`.
+- **`NB_PRELOAD_SCOPE`** (`cluster` | `all`, default `cluster`) — how much of NetBox is read
+  before a sync; see [Tuning NetBox load](README.md#tuning-netbox-load).
+- **Test suite** — 141 pytest cases needing no live Proxmox or NetBox
+  (`pip install -e '.[dev]' && pytest`), run on Python 3.9–3.13 in GitHub Actions.
 
 ### Changed
 
 - **Quick check uses `/cluster/resources`:** 1 request per cycle instead of 2 per node, and a
-  retag or pool move is now detected within one interval instead of at the next full sync. Where
-  the endpoint is unavailable the per-node path is used, chosen once at startup. Pools are not
-  in a per-node listing, so the full sync rebuilds them from `/pools`; only when that is
-  unreadable too does `SYNC_POOLS` report a configuration error rather than silently matching
-  nothing.
-- **`NB_PRELOAD_SCOPE=cluster` (default):** VMs, interfaces and disks are fetched by `cluster_id`,
-  devices only by Proxmox node name. IPs, prefixes, MACs, VLANs, tags and roles stay global — they
-  are matched across all of NetBox. `all` restores 1.1.0 behaviour, needed only to adopt a VM from
-  another cluster. A scoped query that answers without naming every Proxmox node is widened rather
-  than trusted, so the narrowing can never turn into "this node has no device in NetBox".
-  Before/after figures on a large inventory are still to be collected.
+  retag or pool move is detected within one interval instead of at the next full sync. The
+  per-node path stays as a fallback, chosen once at startup.
+- **`NB_PRELOAD_SCOPE=cluster` (default)** fetches VMs, interfaces and disks by `cluster_id` and
+  only the devices named like a Proxmox node; IPs, prefixes, MACs, VLANs, tags and roles stay
+  global. On a NetBox of 10 clusters and 3 000 VMs that is 30 000 records instead of 44 000: 36%
+  less time, 40% less peak memory. `all` restores 1.1.0 behaviour, needed only to adopt a VM from
+  another cluster.
 - A downed node's guests report status `unknown`, which no longer counts as a change.
 
 ### Fixed
 
-Four of these could destroy data:
+Five of these could destroy data:
 
 - **`ENABLE_CLEANUP=true` deleted VMs of other NetBox clusters** — two Proxmox clusters syncing
-  into one NetBox removed each other's records. Cleanup now checks each VM's cluster.
+  into one NetBox removed each other's records; cleanup now checks each VM's cluster.
 - **`ENABLE_CLEANUP=true` with `SYNC_LXC=false` (or `SYNC_VMS=false`) deleted every container (or
   VM)** — a disabled type was read as "gone from Proxmox".
-- **A failed NetBox read duplicated interfaces and disks.** Loads are now chunked per VM, and a
+- **`ENABLE_CLEANUP=true` deleted the guests of a node with no matching NetBox device** — the node
+  is skipped (`NODE_MISSING_POLICY=skip`) and its guests were then read as gone from Proxmox. They
+  are now left alone; the node still goes unsynced with an error in the log.
+- **A failed NetBox read duplicated interfaces and disks** — loads are now chunked per VM, and a
   guest whose cache could not be filled is skipped with an error instead of synced against an
   empty cache.
-- **A device query NetBox honoured only in part emptied guests out of NetBox.** With
-  `NB_PRELOAD_SCOPE=cluster` the devices are fetched by Proxmox node name; a NetBox version
-  without `name__ie` fell back to a case-sensitive match, and a version that narrows a
-  multi-value filter to its last value returned one device out of many — in both cases without an
-  error. The nodes left out then looked like "no matching device in NetBox", which stops the node
-  (`NODE_MISSING_POLICY=skip`) or the process (`fail`), and a skipped node's guests never reach
-  "still in Proxmox", so `ENABLE_CLEANUP=true` deleted them. The answer is now checked against
-  the node names that were asked for and widened if it falls short.
-- **The per-node fallback stripped every `Pool/*` tag.** Tags are written to NetBox wholesale, so
-  a pass that could not see pools removed the pool tag from every guest it synced. Pool membership
-  is now rebuilt from `/pools`, and the residual case — neither endpoint readable — warns about
-  the consequence instead of doing it silently.
-- A query only widens its filter on HTTP 400 ("unknown filter"); a timeout or 502 is raised
-  instead of escalating into a read of the whole inventory.
+- **A device query NetBox honoured only in part emptied guests out of NetBox** — a silently
+  narrowed answer left nodes looking deviceless, and their guests were deleted. Answers are now
+  checked against the names asked for and widened if they fall short.
+- **The per-node fallback stripped every `Pool/*` tag** — pool membership is rebuilt from
+  `/pools`, and the residual case (neither endpoint readable) warns instead of doing it silently.
+- A query widens its filter only on HTTP 400; a timeout or 502 is raised instead of escalating
+  into a read of the whole inventory.
 - Batched `serial=` lookups are verified — some NetBox versions narrow such a query to its last
-  value instead of rejecting it, returning one VM out of fifty.
+  value, returning one VM out of fifty.
 - A pool with an empty ID no longer produces a meaningless `Pool/` tag.
 
 ### Upgrade notes
 
 - No action needed; set `NB_PRELOAD_SCOPE=all` only if you relied on adopting VMs from other
-  clusters. `SYNC_POOLS` now requires a token that can read `/cluster/resources` or `/pools`.
+  clusters. `SYNC_POOLS` now needs a token that can read `/cluster/resources` or `/pools`.
 - The first quick check reports every guest as changed (tracked state gained `pool` and `tags`)
   and settles after one cycle.
 

@@ -141,7 +141,9 @@ EXCLUDE_VMIDS: 4)` — and the same number is exported as `pve2netbox_guests_fil
 **Filtered guests are never deleted.** They still exist in Proxmox, so `ENABLE_CLEANUP=true`
 leaves their NetBox records untouched; only guests that are really gone are removed. The same now
 holds for `SYNC_VMS=false` / `SYNC_LXC=false`, which used to make cleanup delete every VM or
-container of the disabled type.
+container of the disabled type, and for the guests of a node skipped by
+`NODE_MISSING_POLICY=skip` — a node missing its NetBox device goes unsynced, but its guests are
+not deleted.
 
 Filters apply to the full sync, the quick check and cleanup alike. `SYNC_POOLS` is the one
 exception: pool membership needs `/cluster/resources`, the only endpoint that answers it in a
@@ -286,6 +288,28 @@ Use `all` only if VMs have to be adopted into this cluster from another one. It 
 setting and nothing more: `ENABLE_CLEANUP` checks each VM's cluster before deleting it, so VMs
 belonging to another cluster are safe under either value.
 
+How much it saves depends on how much of NetBox belongs to other clusters — the global IPAM read
+is the floor both values pay. Measured with `tools/preload_bench.py` on a NetBox of 10 clusters,
+one of them synced:
+
+| Inventory | Scope | Requests | Records | Read | Time | Peak memory |
+|-----------|-------|---------:|--------:|-----:|-----:|------------:|
+| 3 000 VMs, 20 000 IPs | `cluster` | 35 | 29 810 | 16.3 MiB | 13.0 s | 114 MiB |
+| | `all` | 47 | 43 800 | 24.8 MiB | 20.4 s | 190 MiB |
+| 5 000 VMs, 50 000 IPs | `cluster` | 76 | 71 812 | 39.1 MiB | 34.1 s | 272 MiB |
+| | `all` | 98 | 95 100 | 53.4 MiB | 45.3 s | 398 MiB |
+
+Below that scale there is nothing to save: on a real NetBox of 36 VMs and 70 IP addresses both
+values read the same 314 records, and `cluster` spent two requests more widening a device query.
+It never costs more than that.
+
+Measure your own installation:
+
+```bash
+python tools/preload_bench.py                    # a generated inventory, no NetBox needed
+python tools/preload_bench.py --mode live        # the NetBox from your .env, read-only
+```
+
 ---
 
 ## Development
@@ -297,5 +321,9 @@ pylint pve2netbox
 ```
 
 The tests use no live Proxmox or NetBox. They pin the filter verdicts — the full sync, the quick
-check and cleanup have to agree about every guest — and the behaviour of a NetBox read that fails
-or answers something other than what was asked for.
+check and cleanup have to agree about every guest — the behaviour of a NetBox read that fails or
+answers something other than what was asked for, and the promise that `NB_PRELOAD_SCOPE` changes
+only how much is read, never what the sync is given.
+
+`tools/preload_bench.py` measures that preload; it is a development tool and not part of the
+installed package.

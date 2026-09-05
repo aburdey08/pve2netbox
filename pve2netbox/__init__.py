@@ -1893,6 +1893,30 @@ def _collect_pve_guest_metadata(
     return pve_vm_tags, pve_vm_pools, pve_template_vmids
 
 
+def _spare_guests_of_skipped_node(
+        _decisions: FilterDecisions,
+        _node_name: str,
+        _current_vmids: set,
+        _templates_to_drop: Set[int],
+) -> int:
+    """
+    Count a skipped node's guests as still present, so cleanup spares them.
+
+    A node without a matching NetBox device is a configuration error; letting
+    ``ENABLE_CLEANUP`` delete the records of the guests running on it would
+    turn that error into data loss. They are known from the cluster-wide
+    listing, which sees every node — including the ones the sync loop never
+    reaches.
+
+    Templates are left out under ``TEMPLATE_POLICY=skip``: those are meant to
+    be absent from NetBox whichever node they sit on. Returns how many guests
+    were spared.
+    """
+    vmids = _decisions.vmids_by_node.get(_node_name, set()) - _templates_to_drop
+    _current_vmids.update(vmids)
+    return len(vmids)
+
+
 def _skip_filtered_guest(
         _decisions: FilterDecisions,
         _entry: dict,
@@ -2414,7 +2438,16 @@ def main(
             if config.node_missing_policy == 'fail':
                 logger.error(f'{message} Exiting (NODE_MISSING_POLICY=fail).')
                 sys.exit(1)
-            logger.error(f'{message} Skipping the node (NODE_MISSING_POLICY=skip).')
+            spared = _spare_guests_of_skipped_node(
+                decisions,
+                pve_node['node'],
+                current_vmids,
+                pve_template_vmids if skip_templates else set(),
+            )
+            logger.error(
+                f'{message} Skipping the node (NODE_MISSING_POLICY=skip); '
+                f'its {spared} guest(s) stay in NetBox untouched.'
+            )
             continue
         if not config.dry_run:
             nb_device.status = 'active' if pve_node['status'] == 'online' else 'offline'

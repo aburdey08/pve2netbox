@@ -199,16 +199,24 @@ class FilterDecisions:
 
     The verdict is reached once from the cluster-wide listing (the only source
     that knows the pool) and reused by the per-node loops, which see less. Also
-    holds the summary counters and the excluded VMIDs cleanup must not touch.
+    holds the summary counters, the excluded VMIDs cleanup must not touch, and
+    which node every guest was seen on.
     """
 
     def __init__(self, filters: GuestFilters):
         self.filters = filters
         self._verdicts: Dict[int, Optional[str]] = {}
         self.counts: Dict[str, int] = {}
+        self.vmids_by_node: Dict[str, Set[int]] = {}
 
     def evaluate(self, guest: Guest) -> Optional[str]:
         """Rule excluding ``guest``, or ``None``; counted and logged once per VMID."""
+        if guest.node:
+            # Recorded for every guest, verdict or not: the sync needs the
+            # guests of a node it cannot process, and this listing is the only
+            # place they appear.
+            self.vmids_by_node.setdefault(guest.node, set()).add(guest.vmid)
+
         cached = self._verdicts.get(guest.vmid, _UNSET)
         if cached is not _UNSET:
             return cached  # type: ignore[return-value]

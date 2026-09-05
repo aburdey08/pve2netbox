@@ -164,6 +164,26 @@ class TestFilterDecisions:
         d.is_excluded(guest(vmid=5, kind=LXC))
         assert d.excluded_vmids == {5}
 
+    def test_every_guest_is_recorded_against_its_node(self):
+        # The sync needs the guests of a node it cannot process, and this
+        # cluster-wide pass is the only place they are seen.
+        d = FilterDecisions(GuestFilters(exclude_tags=frozenset({'skip'})))
+        d.is_excluded(guest(vmid=10, node='pve1'))
+        d.is_excluded(guest(vmid=11, node='pve2'))
+        d.is_excluded(guest(vmid=12, node='pve2', tags=('skip',)))
+        assert d.vmids_by_node == {'pve1': {10}, 'pve2': {11, 12}}
+
+    def test_a_guest_seen_twice_is_recorded_once(self):
+        d = FilterDecisions(GuestFilters())
+        d.is_excluded(guest(vmid=13, node='pve1'))
+        d.is_excluded(guest(vmid=13, node='pve1'))
+        assert d.vmids_by_node == {'pve1': {13}}
+
+    def test_a_guest_without_a_node_is_not_recorded(self):
+        d = FilterDecisions(GuestFilters())
+        d.is_excluded(guest(vmid=14, node=''))
+        assert d.vmids_by_node == {}
+
     def test_summary_is_silent_without_filters(self, caplog):
         FilterDecisions(GuestFilters()).log_summary()
         assert caplog.records == []
