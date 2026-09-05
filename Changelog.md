@@ -1,5 +1,63 @@
 # pve2netbox
 
+## [1.2.0] - 2026-09-04
+
+Configurable guest selection, a quick check that costs one Proxmox request instead of two per
+node, and a full sync that no longer reads all of NetBox into memory.
+
+### Added
+
+- **Selection filters.** Comma- or space-separated, case-insensitive; a guest must pass all of
+  them. Filtered guests are never deleted by `ENABLE_CLEANUP` — they still exist in Proxmox.
+
+  | Variable | Meaning |
+  |----------|---------|
+  | `SYNC_NODES` / `EXCLUDE_NODES` | Only these Proxmox nodes / skip these nodes |
+  | `SYNC_POOLS` | Only guests in these Proxmox pools |
+  | `INCLUDE_TAGS` / `EXCLUDE_TAGS` | Only guests with these PVE tags / skip guests with them |
+  | `EXCLUDE_VMIDS` | Single IDs and ranges: `100,105,900-999` |
+
+  Each sync logs `Filters excluded 12 of 340 guest(s) (EXCLUDE_TAGS: 8, EXCLUDE_VMIDS: 4)` and
+  exports the count as **`pve2netbox_guests_filtered`**.
+- **`NB_PRELOAD_SCOPE`** (`cluster` | `all`, default `cluster`) — see below.
+
+### Changed
+
+- **Quick check uses `/cluster/resources`:** 1 request per cycle instead of 2 per node, and a
+  retag or pool move is now detected within one interval instead of at the next full sync. Where
+  the endpoint is unavailable the per-node path is used, chosen once at startup; pools are
+  invisible there, so `SYNC_POOLS` reports a configuration error rather than silently matching
+  nothing.
+- **`NB_PRELOAD_SCOPE=cluster` (default):** VMs, interfaces and disks are fetched by `cluster_id`,
+  devices only by Proxmox node name. IPs, prefixes, MACs, VLANs, tags and roles stay global — they
+  are matched across all of NetBox. `all` restores 1.1.0 behaviour, needed only to adopt a VM from
+  another cluster. Before/after figures on a large inventory are still to be collected.
+- A downed node's guests report status `unknown`, which no longer counts as a change.
+
+### Fixed
+
+Three of these could destroy data:
+
+- **`ENABLE_CLEANUP=true` deleted VMs of other NetBox clusters** — two Proxmox clusters syncing
+  into one NetBox removed each other's records. Cleanup now checks each VM's cluster.
+- **`ENABLE_CLEANUP=true` with `SYNC_LXC=false` (or `SYNC_VMS=false`) deleted every container (or
+  VM)** — a disabled type was read as "gone from Proxmox".
+- **A failed NetBox read duplicated interfaces and disks.** Loads are now chunked per VM, and a
+  guest whose cache could not be filled is skipped with an error instead of synced against an
+  empty cache.
+- A query only widens its filter on HTTP 400 ("unknown filter"); a timeout or 502 is raised
+  instead of escalating into a read of the whole inventory.
+- Batched `serial=` lookups are verified — some NetBox versions narrow such a query to its last
+  value instead of rejecting it, returning one VM out of fifty.
+- A pool with an empty ID no longer produces a meaningless `Pool/` tag.
+
+### Upgrade notes
+
+- No action needed; set `NB_PRELOAD_SCOPE=all` only if you relied on adopting VMs from other
+  clusters. `SYNC_POOLS` now requires a token that can read `/cluster/resources`.
+- The first quick check reports every guest as changed (tracked state gained `pool` and `tags`)
+  and settles after one cycle.
+
 ## [1.1.0] - 2026-08-22
 
 Feature release: LXC containers finally get their IP addresses into NetBox, and VM records carry

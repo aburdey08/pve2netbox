@@ -4,7 +4,7 @@ import ipaddress
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 
 IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
@@ -40,7 +40,100 @@ NB_COMMENTS_MAX_LENGTH = 5000
 """Self-imposed cap for ``comments``. The NetBox field is unbounded, but a
 runaway note should not turn every sync into a large write."""
 
+NB_PRELOAD_SCOPES = ('cluster', 'all')
+"""Allowed values of ``NB_PRELOAD_SCOPE``: load only what is attached to the
+target cluster, or every device, VM, interface and disk (pre-1.2.0)."""
+
 _ENV_KEY_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+_VMID_RANGE_RE = re.compile(r'^(\d+)-(\d+)$')
+
+_VMID_RANGE_SPACING_RE = re.compile(r'\s*-\s*')
+"""Whitespace around a range dash. Normalised away before the list is split on
+whitespace, so that ``900 - 999`` means the range a reader expects rather than
+two single IDs and a stray ``-``."""
+
+
+@dataclass(frozen=True)
+class VmidRanges:
+    """
+    Parsed ``EXCLUDE_VMIDS``: single IDs plus inclusive ranges.
+
+    Kept as ranges rather than expanded into a set — ``900-999999`` is a
+    perfectly reasonable thing to write and must not allocate a million ints.
+    """
+    singles: FrozenSet[int] = frozenset()
+    ranges: Tuple[Tuple[int, int], ...] = ()
+
+    def __contains__(self, vmid: object) -> bool:
+        if not isinstance(vmid, int):
+            return False
+        if vmid in self.singles:
+            return True
+        return any(low <= vmid <= high for low, high in self.ranges)
+
+    def __bool__(self) -> bool:
+        return bool(self.singles or self.ranges)
+
+    def __str__(self) -> str:
+        parts = [str(vmid) for vmid in sorted(self.singles)]
+        parts += [f'{low}-{high}' for low, high in self.ranges]
+        return ', '.join(parts)
+
+
+def parse_vmid_ranges(raw: Optional[str], errors: Optional[List[str]] = None) -> VmidRanges:
+    """
+    Parse ``EXCLUDE_VMIDS`` (``100,105,900-999``) into a :class:`VmidRanges`.
+
+    Commas and/or whitespace separate; spaces around the dash are tolerated.
+    A malformed entry is a configuration error, not a skipped token: a typo in
+    an exclusion list would otherwise sync guests believed to be excluded.
+    """
+    if not raw:
+        return VmidRanges()
+
+    singles: List[int] = []
+    ranges: List[Tuple[int, int]] = []
+    normalised = _VMID_RANGE_SPACING_RE.sub('-', raw.replace(',', ' '))
+    for token in normalised.split():
+        match = _VMID_RANGE_RE.match(token)
+        if match:
+            low, high = int(match.group(1)), int(match.group(2))
+            if low > high:
+                low, high = high, low
+            ranges.append((low, high))
+            continue
+        if token.isdigit():
+            singles.append(int(token))
+            continue
+        message = f'EXCLUDE_VMIDS: invalid entry "{token}" (expected 100 or 900-999)'
+        if errors is None:
+            print(f'Warning: {message}', file=sys.stderr)
+        else:
+            errors.append(message)
+
+    return VmidRanges(singles=frozenset(singles), ranges=tuple(ranges))
+
+
+def parse_name_list(raw: Optional[str]) -> Tuple[str, ...]:
+    """
+    Parse a comma- and/or whitespace-separated list of names into a tuple.
+
+    Order is kept and duplicates dropped, so startup logging shows what was
+    configured.
+    """
+    if not raw:
+        return ()
+
+    names: List[str] = []
+    seen = set()
+    for token in raw.replace(',', ' ').split():
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(token)
+    return tuple(names)
 
 
 @dataclass
@@ -57,6 +150,9 @@ class Config:
     enable_health_endpoint, node_missing_policy.
     Fields: lxc_ip_source, sync_description, description_target, sync_platform,
     platform_map, pool_as_tenant, template_policy.
+    Filters: sync_nodes, exclude_nodes, sync_pools, include_tags, exclude_tags,
+    exclude_vmids.
+    Performance: nb_preload_scope.
     """
     pve_api_host: str
     pve_api_user: str
@@ -92,6 +188,13 @@ class Config:
     platform_map: Dict[str, str] = field(default_factory=dict)
     pool_as_tenant: bool = False
     template_policy: str = 'tag'
+    sync_nodes: Tuple[str, ...] = ()
+    exclude_nodes: Tuple[str, ...] = ()
+    sync_pools: Tuple[str, ...] = ()
+    include_tags: Tuple[str, ...] = ()
+    exclude_tags: Tuple[str, ...] = ()
+    exclude_vmids: VmidRanges = VmidRanges()
+    nb_preload_scope: str = 'cluster'
 
 
 def load_env_file(path: str, override: bool = False) -> int:
@@ -255,6 +358,21 @@ def load_config() -> Config:
             f'got "{template_policy}"'
         )
 
+    nb_preload_scope = os.getenv('NB_PRELOAD_SCOPE', 'cluster').strip().lower()
+    if nb_preload_scope not in NB_PRELOAD_SCOPES:
+        errors.append(
+            f'NB_PRELOAD_SCOPE must be one of {", ".join(NB_PRELOAD_SCOPES)}, '
+            f'got "{nb_preload_scope}"'
+        )
+
+    sync_nodes = parse_name_list(os.getenv('SYNC_NODES'))
+    exclude_nodes = parse_name_list(os.getenv('EXCLUDE_NODES'))
+    sync_pools = parse_name_list(os.getenv('SYNC_POOLS'))
+    include_tags = parse_name_list(os.getenv('INCLUDE_TAGS'))
+    exclude_tags = parse_name_list(os.getenv('EXCLUDE_TAGS'))
+    exclude_vmids = parse_vmid_ranges(os.getenv('EXCLUDE_VMIDS'), errors)
+    errors.extend(_contradicting_filters(sync_nodes, exclude_nodes, include_tags, exclude_tags))
+
     if errors:
         print('Configuration errors:', file=sys.stderr)
         for error in errors:
@@ -303,12 +421,45 @@ def load_config() -> Config:
             platform_map=platform_map,
             pool_as_tenant=_env_flag('POOL_AS_TENANT', False),
             template_policy=template_policy,
+            sync_nodes=sync_nodes,
+            exclude_nodes=exclude_nodes,
+            sync_pools=sync_pools,
+            include_tags=include_tags,
+            exclude_tags=exclude_tags,
+            exclude_vmids=exclude_vmids,
+            nb_preload_scope=nb_preload_scope,
         )
     except (ValueError, TypeError) as e:
         print(f'Configuration parsing error: {e}', file=sys.stderr)
         sys.exit(1)
 
     return config
+
+
+def _contradicting_filters(
+        sync_nodes: Tuple[str, ...],
+        exclude_nodes: Tuple[str, ...],
+        include_tags: Tuple[str, ...],
+        exclude_tags: Tuple[str, ...],
+) -> List[str]:
+    """
+    Report filter pairs that can never both be satisfied.
+
+    The same node or tag in both an include and an exclude list is always a
+    mistake: the exclusion wins and the guest silently disappears.
+    """
+    problems: List[str] = []
+    both_nodes = {n.lower() for n in sync_nodes} & {n.lower() for n in exclude_nodes}
+    if both_nodes:
+        problems.append(
+            f'SYNC_NODES and EXCLUDE_NODES both list: {", ".join(sorted(both_nodes))}'
+        )
+    both_tags = {t.lower() for t in include_tags} & {t.lower() for t in exclude_tags}
+    if both_tags:
+        problems.append(
+            f'INCLUDE_TAGS and EXCLUDE_TAGS both list: {", ".join(sorted(both_tags))}'
+        )
+    return problems
 
 
 ROLE_COLORS = {
@@ -470,4 +621,22 @@ def describe_config(config: Config) -> List[Tuple[str, Any]]:
         ('Sync platform', config.sync_platform),
         ('Pool as tenant', config.pool_as_tenant),
         ('Template policy', config.template_policy),
-    ]
+        ('NetBox preload scope', config.nb_preload_scope),
+    ] + describe_filters(config)
+
+
+def describe_filters(config: Config) -> List[Tuple[str, Any]]:
+    """(label, value) pairs for the configured filters; empty when there are none."""
+    described: List[Tuple[str, Any]] = []
+    for label, values in (
+        ('SYNC_NODES', config.sync_nodes),
+        ('EXCLUDE_NODES', config.exclude_nodes),
+        ('SYNC_POOLS', config.sync_pools),
+        ('INCLUDE_TAGS', config.include_tags),
+        ('EXCLUDE_TAGS', config.exclude_tags),
+    ):
+        if values:
+            described.append((f'Filter {label}', ', '.join(values)))
+    if config.exclude_vmids:
+        described.append(('Filter EXCLUDE_VMIDS', str(config.exclude_vmids)))
+    return described

@@ -8,7 +8,7 @@ import ipaddress
 import re
 import sys
 import time
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Set, Tuple, Any
 
 import pynetbox
 import requests
@@ -16,7 +16,7 @@ from proxmoxer import ProxmoxAPI, ResourceException
 
 from . import shutdown
 from .api.netbox import make_netbox_session, resolve_cluster
-from .api.proxmox import create_proxmox_api
+from .api.proxmox import QUICK_CHECK_SOURCE_CLUSTER, create_proxmox_api
 from .api.proxmox import quick_check_changes as _api_quick_check_changes
 from .config import (
     Config,
@@ -28,6 +28,7 @@ from .config import (
     load_config,
     set_config,
 )
+from .filters import LXC, QEMU, FilterDecisions, Guest, get_filters
 from .logger import logger, log_section
 from .lxc import build_lxc_agent_data
 from .metrics import metrics
@@ -191,17 +192,113 @@ def _provision_roles(_nb_api: pynetbox.api) -> None:
             logger.error(f'  ! Failed to create role "{role_def["name"]}": {e}')
 
 
-def _load_nb_objects(_nb_api: pynetbox.api) -> dict:
-    """
-    Load all NetBox objects needed for full sync into a single cache dict.
+NB_FILTER_CHUNK_SIZE = 50
+"""IDs per filtered NetBox request: short enough for any proxy in front of
+NetBox, long enough to replace hundreds of lookups with a handful."""
 
-    Loads devices, virtual machines, interfaces, MAC addresses, prefixes,
-    IP addresses, VLANs, virtual disks, tags, and device roles. Keys are
-    normalized (e.g. device name lowercased, VM by serial). Returns dict
-    with keys as above.
+
+def _fetch_all(_endpoint: Any, _label: str) -> List[Any]:
+    """Read a whole NetBox endpoint, logging what it cost."""
+    records = list(_endpoint.all())
+    logger.debug(f'  - Loaded {len(records)} {_label} (unfiltered)')
+    return records
+
+
+def _is_filter_rejected(_error: Exception) -> bool:
     """
-    logger.info('Loading NetBox objects...')
-    _nb_objects = {
+    True when NetBox answered HTTP 400 — "I do not know that filter".
+
+    Only that means the query must be widened. Widening on a timeout or a 502
+    would turn a momentary outage into a read of the whole inventory.
+    """
+    status = getattr(getattr(_error, 'req', None), 'status_code', None)
+    if status is None:
+        status = getattr(getattr(_error, 'response', None), 'status_code', None)
+    return status == 400
+
+
+def _fetch_filtered(_endpoint: Any, _label: str, _param_sets: List[dict]) -> List[Any]:
+    """
+    Read a NetBox endpoint, trying each parameter set until one is accepted.
+
+    Which filters exist differs between NetBox versions, so a rejected one
+    falls back to the next; the caller ends the list with ``{}`` ("load
+    everything") — slower, always correct. Any other failure is raised.
+    """
+    for index, params in enumerate(_param_sets):
+        try:
+            records = list(_endpoint.filter(**params) if params else _endpoint.all())
+            logger.debug(f'  - Loaded {len(records)} {_label} ({params or "unfiltered"})')
+            return records
+        except Exception as e:  # pylint: disable=broad-except
+            if index == len(_param_sets) - 1 or not _is_filter_rejected(e):
+                raise
+            logger.warning(
+                f'  NetBox rejected {list(params)} for {_label} ({e}); trying a wider query'
+            )
+    return []
+
+
+def _fetch_for_vms(
+        _endpoint: Any,
+        _label: str,
+        _vm_ids: List[int],
+) -> Tuple[List[Any], Set[int]]:
+    """
+    Read the records of the given VM IDs in chunks; returns ``(records, unloaded)``.
+
+    A failed chunk costs only its own VMs, and those count as *unknown*, never
+    as *empty*: an empty cache makes the sync duplicate every interface and
+    disk the VM already has.
+    """
+    records: List[Any] = []
+    unloaded: Set[int] = set()
+    for start in range(0, len(_vm_ids), NB_FILTER_CHUNK_SIZE):
+        chunk = _vm_ids[start:start + NB_FILTER_CHUNK_SIZE]
+        try:
+            records.extend(_endpoint.filter(virtual_machine_id=chunk))
+        except Exception as e:  # pylint: disable=broad-except
+            unloaded.update(chunk)
+            logger.warning(
+                f'  Failed to load {_label} for {len(chunk)} VM(s) ({e}); '
+                f'those VMs will be skipped this pass'
+            )
+    logger.debug(
+        f'  - Loaded {len(records)} {_label} '
+        f'(for {len(_vm_ids) - len(unloaded)} of {len(_vm_ids)} VMs)'
+    )
+    return records, unloaded
+
+
+def _fetch_cluster_scoped(
+        _endpoint: Any,
+        _label: str,
+        _cluster_id: int,
+        _vm_ids: List[int],
+) -> Tuple[List[Any], Set[int]]:
+    """
+    Read everything of one kind belonging to the cluster's VMs.
+
+    One ``cluster_id`` query, falling back to chunked ``virtual_machine_id``
+    lookups where the endpoint has no cluster filter. Any non-400 failure is
+    raised: a partial cache must never pass for a complete one.
+    """
+    if not _vm_ids:
+        return [], set()
+    try:
+        records = list(_endpoint.filter(cluster_id=_cluster_id))
+        logger.debug(f'  - Loaded {len(records)} {_label} (cluster {_cluster_id})')
+        return records, set()
+    except Exception as e:  # pylint: disable=broad-except
+        if not _is_filter_rejected(e):
+            raise
+        logger.debug(f'  - No cluster_id filter for {_label} ({e}); querying by VM')
+        return _fetch_for_vms(_endpoint, _label, _vm_ids)
+
+
+def _empty_nb_objects() -> dict:
+    """The cache layout shared by the full and the incremental loader."""
+    return {
         'devices': {},
         'virtual_machines': {},
         'virtual_machines_by_name_cluster': {},
@@ -215,47 +312,193 @@ def _load_nb_objects(_nb_api: pynetbox.api) -> dict:
         'roles': {},
         'platforms': {},
         'tenants': {},
+        'incomplete_vmids': set(),
     }
-    logger.debug('  - Loading devices...')
-    for _nb_device in _nb_api.dcim.devices.all():
-        _nb_objects['devices'][_nb_device.name.lower()] = _nb_device
-    logger.debug('  - Loading virtual machines...')
-    vm_ids = []
-    for _nb_virtual_machine in _nb_api.virtualization.virtual_machines.all():
-        _index_nb_virtual_machine(_nb_objects, _nb_virtual_machine)
-        vm_ids.append(_nb_virtual_machine.id)
-    logger.debug('  - Loading interfaces...')
-    interfaces_list = list(_nb_api.virtualization.interfaces.all())
-    for _nb_interface in interfaces_list:
-        if _nb_interface.virtual_machine.id not in _nb_objects['virtual_machines_interfaces']:
-            _nb_objects['virtual_machines_interfaces'][_nb_interface.virtual_machine.id] = {}
-        _nb_objects['virtual_machines_interfaces'][_nb_interface.virtual_machine.id][_nb_interface.name] = _nb_interface
-    logger.debug('  - Loading MAC addresses...')
-    for _nb_mac_address in _nb_api.dcim.mac_addresses.all():
+
+
+def _mark_incomplete_preload(_nb_objects: dict, _unloaded_vm_ids: Set[int]) -> None:
+    """
+    Record the VMIDs whose NetBox cache could not be filled, so they get skipped.
+
+    Anything missing from the cache gets created, so syncing such a guest would
+    duplicate every interface and disk it already has.
+    """
+    if not _unloaded_vm_ids:
+        return
+    for serial, nb_vm in _nb_objects['virtual_machines'].items():
+        if getattr(nb_vm, 'id', None) in _unloaded_vm_ids:
+            try:
+                _nb_objects['incomplete_vmids'].add(int(serial))
+            except (ValueError, TypeError):
+                continue
+
+
+def _preload_incomplete(_nb_objects: dict, _vmid: int) -> bool:
+    """True when this guest's NetBox objects failed to preload; it must be skipped."""
+    return _vmid in _nb_objects.get('incomplete_vmids', set())
+
+
+def _index_nb_interfaces(_nb_objects: dict, _interfaces: List[Any]) -> None:
+    """Index VM interfaces by owning VM and interface name."""
+    for _nb_interface in _interfaces:
+        vm_id = _nb_interface.virtual_machine.id
+        _nb_objects['virtual_machines_interfaces'].setdefault(vm_id, {})
+        _nb_objects['virtual_machines_interfaces'][vm_id][_nb_interface.name] = _nb_interface
+
+
+def _index_nb_disks(_nb_objects: dict, _disks: List[Any]) -> None:
+    """Index virtual disks by owning VM and disk name."""
+    for _nb_disk in _disks:
+        vm_id = _nb_disk.virtual_machine.id
+        _nb_objects['disks'].setdefault(vm_id, {})
+        _nb_objects['disks'][vm_id][_nb_disk.name] = _nb_disk
+
+
+def _load_nb_shared_objects(_nb_api: pynetbox.api, _nb_objects: dict) -> Dict[str, int]:
+    """
+    Load the caches that stay global whatever ``NB_PRELOAD_SCOPE`` says.
+
+    An IP or MAC that already exists elsewhere in NetBox must be found, not
+    duplicated, so scoping these would change what the sync writes — which is
+    exactly what ``NB_PRELOAD_SCOPE`` must not do. VLANs, tags and roles are
+    small lookup tables.
+    """
+    counts: Dict[str, int] = {}
+
+    for _nb_mac_address in _fetch_all(_nb_api.dcim.mac_addresses, 'MAC addresses'):
         _nb_objects['mac_addresses'][_nb_mac_address.mac_address] = _nb_mac_address
-    logger.debug('  - Loading prefixes...')
-    for _nb_prefix in _nb_api.ipam.prefixes.all():
+    counts['MACs'] = len(_nb_objects['mac_addresses'])
+
+    for _nb_prefix in _fetch_all(_nb_api.ipam.prefixes, 'prefixes'):
         _nb_objects['prefixes'][_nb_prefix.prefix] = _nb_prefix
-    logger.debug('  - Loading IP addresses...')
-    for _nb_ip_address in _nb_api.ipam.ip_addresses.all():
+    counts['prefixes'] = len(_nb_objects['prefixes'])
+
+    for _nb_ip_address in _fetch_all(_nb_api.ipam.ip_addresses, 'IP addresses'):
         _nb_objects['ip_addresses'][_nb_ip_address['address']] = _nb_ip_address
-    logger.debug('  - Loading VLANs...')
-    for _nb_vlan in _nb_api.ipam.vlans.all():
+    counts['IPs'] = len(_nb_objects['ip_addresses'])
+
+    for _nb_vlan in _fetch_all(_nb_api.ipam.vlans, 'VLANs'):
         _nb_objects['vlans'][str(_nb_vlan.vid)] = _nb_vlan
-    logger.debug('  - Loading virtual disks...')
-    for _nb_disk in _nb_api.virtualization.virtual_disks.all():
-        if _nb_disk.virtual_machine.id not in _nb_objects['disks']:
-            _nb_objects['disks'][_nb_disk.virtual_machine.id] = {}
-        _nb_objects['disks'][_nb_disk.virtual_machine.id][_nb_disk.name] = _nb_disk
-    logger.debug('  - Loading tags...')
-    for _nb_tag in _nb_api.extras.tags.all():
+    counts['VLANs'] = len(_nb_objects['vlans'])
+
+    for _nb_tag in _fetch_all(_nb_api.extras.tags, 'tags'):
         _nb_objects['tags'][_nb_tag.name] = _nb_tag
-    logger.debug('  - Loading device roles...')
-    for _nb_role in _nb_api.dcim.device_roles.all():
+
+    for _nb_role in _fetch_all(_nb_api.dcim.device_roles, 'device roles'):
         _nb_objects['roles'][_nb_role.name] = _nb_role
         _nb_objects['roles'][str(_nb_role.id)] = _nb_role
+
+    return counts
+
+
+def _load_nb_devices(
+        _nb_api: pynetbox.api,
+        _nb_objects: dict,
+        _node_names: Optional[List[str]],
+        _scoped: bool,
+) -> int:
+    """
+    Cache the NetBox devices the Proxmox nodes map to.
+
+    Scoped: only devices named like a Proxmox node, matched case-insensitively
+    (``name__ie``) as the later lookup is, with a case-sensitive query and an
+    unfiltered read as fallbacks for older NetBox versions.
+    """
+    if _scoped:
+        if not _node_names:
+            # Every node was filtered out; there is no device left to look up.
+            logger.debug('  - No nodes in scope, skipping the device query')
+            return 0
+        devices = _fetch_filtered(
+            _nb_api.dcim.devices,
+            'devices',
+            [{'name__ie': _node_names}, {'name': _node_names}, {}],
+        )
+    else:
+        devices = _fetch_all(_nb_api.dcim.devices, 'devices')
+
+    for _nb_device in devices:
+        _nb_objects['devices'][_nb_device.name.lower()] = _nb_device
+    return len(devices)
+
+
+def _load_nb_objects(
+        _nb_api: pynetbox.api,
+        _node_names: Optional[List[str]] = None,
+) -> dict:
+    """
+    Load the NetBox objects needed for a full sync into one cache dict.
+
+    Under ``NB_PRELOAD_SCOPE=cluster`` VMs, their interfaces and their disks are
+    fetched by cluster and devices narrowed to ``_node_names``; ``all`` reads
+    every one of them, which is only useful to adopt a VM from another cluster.
+    IPs, prefixes, MACs, VLANs, tags and roles are always global — see
+    :func:`_load_nb_shared_objects`.
+
+    Keys are what the sync expects: device name lowercased, VM by serial, and
+    interfaces and disks by owning VM id.
+    """
+    config = _cfg()
+    cluster_id = config.nb_cluster_id
+    scoped = config.nb_preload_scope == 'cluster' and cluster_id is not None
+    logger.info(f'Loading NetBox objects (scope: {"cluster" if scoped else "all"})...')
+
+    _nb_objects = _empty_nb_objects()
+    counts: Dict[str, int] = {}
+
+    logger.debug('  - Loading devices...')
+    counts['devices'] = _load_nb_devices(_nb_api, _nb_objects, _node_names, scoped)
+
+    logger.debug('  - Loading virtual machines...')
+    if scoped:
+        virtual_machines = _fetch_filtered(
+            _nb_api.virtualization.virtual_machines,
+            'virtual machines',
+            [{'cluster_id': cluster_id}, {}],
+        )
+    else:
+        virtual_machines = _fetch_all(_nb_api.virtualization.virtual_machines, 'virtual machines')
+    for _nb_virtual_machine in virtual_machines:
+        _index_nb_virtual_machine(_nb_objects, _nb_virtual_machine)
+    vm_ids = [vm.id for vm in virtual_machines]
+    counts['VMs'] = len(virtual_machines)
+
+    unloaded: Set[int] = set()
+
+    logger.debug('  - Loading interfaces...')
+    if scoped:
+        interfaces, failed = _fetch_cluster_scoped(
+            _nb_api.virtualization.interfaces, 'interfaces', cluster_id, vm_ids)
+        unloaded |= failed
+    else:
+        interfaces = _fetch_all(_nb_api.virtualization.interfaces, 'interfaces')
+    _index_nb_interfaces(_nb_objects, interfaces)
+    counts['interfaces'] = len(interfaces)
+
+    logger.debug('  - Loading virtual disks...')
+    if scoped:
+        disks, failed = _fetch_cluster_scoped(
+            _nb_api.virtualization.virtual_disks, 'virtual disks', cluster_id, vm_ids)
+        unloaded |= failed
+    else:
+        disks = _fetch_all(_nb_api.virtualization.virtual_disks, 'virtual disks')
+    _index_nb_disks(_nb_objects, disks)
+    counts['disks'] = len(disks)
+
+    _mark_incomplete_preload(_nb_objects, unloaded)
+
+    counts.update(_load_nb_shared_objects(_nb_api, _nb_objects))
     _load_nb_platforms_and_tenants(_nb_api, _nb_objects)
-    logger.info('NetBox objects loaded.')
+
+    if _nb_objects['incomplete_vmids']:
+        logger.warning(
+            f'Incomplete NetBox preload for {len(_nb_objects["incomplete_vmids"])} VM(s); '
+            f'they are skipped this pass to avoid creating duplicates'
+        )
+    logger.info(
+        'NetBox objects loaded: '
+        + ', '.join(f'{value} {name}' for name, value in counts.items())
+    )
     return _nb_objects
 
 
@@ -1424,65 +1667,206 @@ def _get_virtual_machine_vcpus(_pve_virtual_machine_config: dict) -> int:
     return _pve_virtual_machine_config['cores'] * _pve_virtual_machine_config['sockets']
 
 
-def quick_check_changes(_pve_api: ProxmoxAPI, _last_state: Dict) -> Tuple[List[int], Dict]:
+def _select_pve_nodes(
+        _pve_api: ProxmoxAPI,
+        _decisions: FilterDecisions,
+        _quiet: bool = False,
+) -> List[dict]:
     """
-    Quick check for VM changes without loading full config.
+    Return the Proxmox nodes taking part in this sync.
 
-    Thin wrapper over :func:`pve2netbox.api.proxmox.quick_check_changes`, kept so
-    the historical import path keeps working. There is deliberately only one
-    implementation: the previous duplicate here ignored
-    ``IGNORE_STATUS_WHEN_LOCKED`` and silently reintroduced changelog noise
-    whenever it was used as a fallback.
-
-    Returns:
-        (list of changed vmid, current state dict).
+    Excluded nodes are dropped before any per-node call is made for them.
+    ``_quiet`` drops the exclusions to DEBUG — the quick sync runs every few
+    seconds and an unchanging list is not worth a line each time.
     """
-    return _api_quick_check_changes(_pve_api, _last_state, _cfg())
+    log = logger.debug if _quiet else logger.info
+    nodes = []
+    for pve_node in _pve_api.nodes.get():
+        reason = _decisions.filters.node_reason(pve_node['node'])
+        if reason is not None:
+            log(f'  Skipping node {pve_node["node"]}: {reason}')
+            continue
+        nodes.append(pve_node)
+    return nodes
 
 
-def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: List[int]) -> Dict:
+def _read_pve_guests(_pve_api: ProxmoxAPI) -> Tuple[List[Tuple[Guest, dict]], bool]:
     """
-    Load from NetBox only objects related to the given VM IDs.
-    Lighter-weight than _load_nb_objects for incremental (quick) sync.
+    Read every guest in the cluster with its raw entry; returns ``(guests, pools_known)``.
+
+    ``/cluster/resources`` is the only endpoint that knows a guest's pool and
+    the only one that sees guests on nodes this sync skips — which is what
+    protects excluded guests from cleanup. The fallback walks every node,
+    filtered-out ones included, so that protection survives without pools.
     """
+    try:
+        resources = _pve_api.cluster.resources.get(type='vm')
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(
+            f'/cluster/resources is not available ({e}); falling back to per-node listings. '
+            f'Pools are invisible on this path.'
+        )
+        return _read_pve_guests_from_nodes(_pve_api), False
+
+    return [(Guest.from_cluster_resource(r), r) for r in resources], True
+
+
+def _read_pve_guests_from_nodes(_pve_api: ProxmoxAPI) -> List[Tuple[Guest, dict]]:
+    """
+    Read every guest by walking all nodes — the fallback for :func:`_read_pve_guests`.
+
+    Ignores the node filters on purpose: a guest on a skipped node still has to
+    be evaluated so cleanup knows not to delete it.
+    """
+    guests: List[Tuple[Guest, dict]] = []
+    for pve_node in _pve_api.nodes.get():
+        node_name = pve_node['node']
+        for kind in (QEMU, LXC):
+            try:
+                entries = getattr(_pve_api.nodes(node_name), kind).get()
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(f'Failed to list {kind} guests on node {node_name}: {e}')
+                continue
+            for entry in entries:
+                guests.append((Guest.from_node_entry(entry, node_name, kind), entry))
+    return guests
+
+
+def _collect_pve_guest_metadata(
+        _pve_api: ProxmoxAPI,
+        _nb_api: pynetbox.api,
+        _nb_objects: dict,
+        _decisions: FilterDecisions,
+        _only_vmids: Optional[set] = None,
+) -> Tuple[Dict[int, List[str]], Dict[int, str], set]:
+    """
+    Read every guest once and derive per-guest tags, pools and templates.
+
+    The same pass feeds the filter decisions — this is the only view of the
+    whole cluster, so its verdicts are what the per-node loops reuse and what
+    protects excluded guests from cleanup. Every guest is evaluated even when
+    ``_only_vmids`` narrows the returned metadata to a quick sync's targets.
+
+    Returns (tags per vmid, pool per vmid, template vmids) for guests that pass
+    the filters. Raises ``RuntimeError`` if ``SYNC_POOLS`` is set but pools
+    could not be read: matching no guest at all would silently empty the sync.
+    """
+    config = _cfg()
+    pve_vm_tags: Dict[int, List[str]] = {}
+    pve_vm_pools: Dict[int, str] = {}
+    pve_template_vmids: set = set()
+
+    guests, pools_known = _read_pve_guests(_pve_api)
+    if not pools_known:
+        if config.sync_pools:
+            raise RuntimeError(
+                'SYNC_POOLS is set but /cluster/resources is unavailable, so no guest can be '
+                'matched to a pool. Grant the API token cluster-wide read permission or unset '
+                'SYNC_POOLS.'
+            )
+        if config.pool_as_tenant:
+            logger.warning(
+                'POOL_AS_TENANT is set but pools are unreadable on this path; '
+                'tenants are left untouched this pass.'
+            )
+
+    for guest, pve_vm_resource in guests:
+        if _decisions.is_excluded(guest):
+            continue
+        if _only_vmids is not None and guest.vmid not in _only_vmids:
+            continue
+
+        pve_vm_tags[guest.vmid] = []
+        if guest.pool:
+            pve_vm_pools[guest.vmid] = guest.pool
+            pve_vm_tags[guest.vmid].append(f'Pool/{guest.pool}')
+
+        if pve_vm_resource.get('template'):
+            pve_template_vmids.add(guest.vmid)
+            if config.template_policy == 'tag':
+                _ensure_nb_tag(TEMPLATE_TAG_NAME, _nb_api, _nb_objects)
+                pve_vm_tags[guest.vmid].append(TEMPLATE_TAG_NAME)
+
+        if config.sync_tags:
+            for _tag_name in guest.tags:
+                _ensure_nb_tag(_tag_name, _nb_api, _nb_objects)
+                pve_vm_tags[guest.vmid].append(_tag_name)
+
+    return pve_vm_tags, pve_vm_pools, pve_template_vmids
+
+
+def _skip_filtered_guest(
+        _decisions: FilterDecisions,
+        _entry: dict,
+        _node_name: str,
+        _kind: str,
+        _pve_vm_pools: Dict[int, str],
+) -> bool:
+    """
+    True when a guest from a per-node listing is excluded by the filters.
+
+    Re-asks with the same VMID, so the verdict already reached cluster-wide is
+    reused and only unseen guests are evaluated fresh.
+    """
+    guest = Guest.from_node_entry(
+        _entry, _node_name, _kind, _pve_vm_pools.get(int(_entry['vmid'])))
+    return _decisions.is_excluded(guest)
+
+
+def quick_check_changes(
+        _pve_api: ProxmoxAPI,
+        _last_state: Dict,
+        _source: str = QUICK_CHECK_SOURCE_CLUSTER,
+) -> Tuple[List[int], Dict]:
+    """
+    Quick check for VM changes; returns ``(changed vmids, current state)``.
+
+    Thin wrapper over :func:`pve2netbox.api.proxmox.quick_check_changes`, kept
+    for the historical import path. Deliberately not a second implementation:
+    the duplicate that used to live here ignored ``IGNORE_STATUS_WHEN_LOCKED``.
+    """
+    return _api_quick_check_changes(
+        _pve_api, _last_state, _cfg(), source=_source, guest_filters=get_filters())
+
+
+def _load_specific_objects(
+        _nb_api: pynetbox.api,
+        _changed_vmids: List[int],
+        _node_names: Optional[List[str]] = None,
+) -> Dict:
+    """
+    Load from NetBox only the objects related to the given VM IDs.
+
+    The quick sync's lighter counterpart to :func:`_load_nb_objects`: VMs by
+    serial in batches, their interfaces, IPs and disks per VM. Prefixes, VLANs,
+    tags and roles are read whole — small, and needed for matching.
+
+    A VM whose objects could not be read goes into ``incomplete_vmids``; an
+    empty cache would read as "no interfaces yet" and duplicate every one.
+    """
+    config = _cfg()
+    cluster_id = config.nb_cluster_id
+    scoped = config.nb_preload_scope == 'cluster' and cluster_id is not None
     logger.info(f'Loading NetBox objects for {len(_changed_vmids)} VMs...')
-    _nb_objects = {
-        'devices': {},
-        'virtual_machines': {},
-        'virtual_machines_by_name_cluster': {},
-        'virtual_machines_interfaces': {},
-        'mac_addresses': {},
-        'prefixes': {},
-        'ip_addresses': {},
-        'vlans': {},
-        'disks': {},
-        'tags': {},
-        'roles': {},
-        'platforms': {},
-        'tenants': {},
-    }
+    _nb_objects = _empty_nb_objects()
+
     logger.debug('  - Loading devices...')
-    for _nb_device in _nb_api.dcim.devices.all():
-        _nb_objects['devices'][_nb_device.name.lower()] = _nb_device
+    _load_nb_devices(_nb_api, _nb_objects, _node_names, scoped)
+
     logger.debug(f'  - Loading {len(_changed_vmids)} specific virtual machines...')
-    for vmid in _changed_vmids:
-        try:
-            vms = _nb_api.virtualization.virtual_machines.filter(serial=str(vmid))
-            for vm in vms:
-                _index_nb_virtual_machine(_nb_objects, vm)
-        except Exception as e:
-            logger.warning(f'Failed to load VM {vmid}: {e}')
-    logger.debug('  - Loading interfaces for changed VMs...')
+    for _nb_virtual_machine in _load_nb_vms_by_serial(_nb_api, _changed_vmids, cluster_id, scoped):
+        _index_nb_virtual_machine(_nb_objects, _nb_virtual_machine)
+
     vm_ids = [vm.id for vm in _nb_objects['virtual_machines'].values()]
-    for vm_id in vm_ids:
-        try:
-            interfaces = _nb_api.virtualization.interfaces.filter(virtual_machine_id=vm_id)
-            if vm_id not in _nb_objects['virtual_machines_interfaces']:
-                _nb_objects['virtual_machines_interfaces'][vm_id] = {}
-            for iface in interfaces:
-                _nb_objects['virtual_machines_interfaces'][vm_id][iface.name] = iface
-        except Exception as e:
-            logger.warning(f'Failed to load interfaces for VM {vm_id}: {e}')
+
+    unloaded: Set[int] = set()
+
+    logger.debug('  - Loading interfaces for changed VMs...')
+    interfaces, failed = _fetch_for_vms(
+        _nb_api.virtualization.interfaces, 'interfaces', vm_ids)
+    _index_nb_interfaces(_nb_objects, interfaces)
+    unloaded |= failed
+
     logger.debug('  - Loading MAC addresses...')
     for vm_interfaces in _nb_objects['virtual_machines_interfaces'].values():
         for iface in vm_interfaces.values():
@@ -1491,43 +1875,117 @@ def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: List[int]) -> 
                     mac = _nb_api.dcim.mac_addresses.get(iface.primary_mac_address.id)
                     if mac:
                         _nb_objects['mac_addresses'][mac.mac_address] = mac
-                except Exception as e:
+                except Exception as e:  # pylint: disable=broad-except
                     logger.warning(f'Failed to load MAC for interface {iface.id}: {e}')
+
     logger.debug('  - Loading prefixes...')
     for _nb_prefix in _nb_api.ipam.prefixes.all():
         _nb_objects['prefixes'][_nb_prefix.prefix] = _nb_prefix
+
     logger.debug('  - Loading IP addresses for changed VMs...')
     for vm_id in vm_ids:
         try:
-            ips = _nb_api.ipam.ip_addresses.filter(virtual_machine_id=vm_id)
-            for ip in ips:
+            for ip in _nb_api.ipam.ip_addresses.filter(virtual_machine_id=vm_id):
                 _nb_objects['ip_addresses'][ip['address']] = ip
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-except
+            unloaded.add(vm_id)
             logger.warning(f'Failed to load IPs for VM {vm_id}: {e}')
+
     logger.debug('  - Loading VLANs...')
     for _nb_vlan in _nb_api.ipam.vlans.all():
         _nb_objects['vlans'][str(_nb_vlan.vid)] = _nb_vlan
+
     logger.debug('  - Loading virtual disks for changed VMs...')
-    for vm_id in vm_ids:
-        try:
-            disks = _nb_api.virtualization.virtual_disks.filter(virtual_machine_id=vm_id)
-            if vm_id not in _nb_objects['disks']:
-                _nb_objects['disks'][vm_id] = {}
-            for disk in disks:
-                _nb_objects['disks'][vm_id][disk.name] = disk
-        except Exception as e:
-            logger.warning(f'Failed to load disks for VM {vm_id}: {e}')
+    disks, failed = _fetch_for_vms(
+        _nb_api.virtualization.virtual_disks, 'virtual disks', vm_ids)
+    _index_nb_disks(_nb_objects, disks)
+    unloaded |= failed
+
     logger.debug('  - Loading tags...')
     for _nb_tag in _nb_api.extras.tags.all():
         _nb_objects['tags'][_nb_tag.name] = _nb_tag
+
     logger.debug('  - Loading device roles...')
     for _nb_role in _nb_api.dcim.device_roles.all():
         _nb_objects['roles'][_nb_role.name] = _nb_role
         _nb_objects['roles'][str(_nb_role.id)] = _nb_role
+
     _load_nb_platforms_and_tenants(_nb_api, _nb_objects)
+    _mark_incomplete_preload(_nb_objects, unloaded)
+    if _nb_objects['incomplete_vmids']:
+        logger.warning(
+            f'Incomplete NetBox preload for {len(_nb_objects["incomplete_vmids"])} VM(s); '
+            f'they are skipped this pass to avoid creating duplicates'
+        )
 
     logger.info('NetBox objects loaded.')
     return _nb_objects
+
+
+def _load_nb_vms_by_serial(
+        _nb_api: pynetbox.api,
+        _vmids: List[int],
+        _cluster_id: Optional[int],
+        _scoped: bool,
+) -> List[Any]:
+    """
+    Fetch the NetBox VMs carrying the given VMIDs in their ``serial`` field.
+
+    Batched, with a per-VMID fallback, so a quick check costs a couple of
+    requests rather than one per changed guest.
+
+    The fallback cannot wait for NetBox to raise: a single-value ``serial``
+    filter silently narrows a list to its last entry, and an unknown one may be
+    ignored and answer with everything. So the answer is checked against what
+    was asked for rather than trusted.
+    """
+    scope = {'cluster_id': _cluster_id} if _scoped else {}
+    serials = [str(vmid) for vmid in _vmids]
+    records: List[Any] = []
+    for start in range(0, len(serials), NB_FILTER_CHUNK_SIZE):
+        chunk = serials[start:start + NB_FILTER_CHUNK_SIZE]
+        batched = None
+        try:
+            batched = list(_nb_api.virtualization.virtual_machines.filter(serial=chunk, **scope))
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(f'Batched serial lookup rejected by NetBox ({e}); querying one by one')
+
+        if batched is not None and _batched_serials_honoured(batched, chunk):
+            records.extend(batched)
+            continue
+
+        if batched is not None:
+            logger.debug(
+                f'NetBox did not honour the batched serial filter for {len(chunk)} VM(s); '
+                f'querying one by one'
+            )
+        for serial in chunk:
+            try:
+                records.extend(
+                    _nb_api.virtualization.virtual_machines.filter(serial=serial, **scope))
+            except Exception as inner:  # pylint: disable=broad-except
+                logger.warning(f'Failed to load VM {serial}: {inner}')
+    return records
+
+
+def _batched_serials_honoured(_records: List[Any], _chunk: List[str]) -> bool:
+    """
+    True when a batched ``serial=`` query looks like NetBox actually applied it.
+
+    Two answers say it did not: a record whose serial was never asked for (the
+    filter was ignored), and a single serial coming back for a chunk of many
+    (a single-value filter kept only the last one). The second test can fire
+    when the chunk genuinely has one match; the cost of being wrong is one
+    round of per-VMID queries, against silently syncing a VM whose interfaces
+    were never loaded.
+    """
+    if len(_chunk) == 1:
+        return True
+    asked = set(_chunk)
+    found = {str(getattr(record, 'serial', '')) for record in _records}
+    if not found <= asked:
+        return False
+    return len(found) > 1
 
 
 def sync_specific_vms(
@@ -1537,61 +1995,66 @@ def sync_specific_vms(
 ) -> None:
     """
     Sync only the given VM IDs to NetBox (incremental quick sync).
-    Loads only needed NetBox objects, processes tags and HA, then syncs VMs per node.
+
+    Loads only the needed NetBox objects, processes tags and HA, then syncs the
+    guests per node. Selection filters are applied here as well as in the quick
+    check, so a guest that became excluded between two cycles is dropped rather
+    than synced one last time.
     """
     if not _changed_vmids:
         logger.info('No changes detected, skipping sync.')
         return
     logger.info(f'Quick sync: processing {len(_changed_vmids)} changed VMs...')
-    nb_objects = _load_specific_objects(_nb_api, _changed_vmids)
+
+    decisions = FilterDecisions(get_filters())
+    pve_nodes = _select_pve_nodes(_pve_api, decisions, _quiet=True)
+    node_names = [pve_node['node'] for pve_node in pve_nodes]
+
+    nb_objects = _load_specific_objects(_nb_api, _changed_vmids, node_names)
     _process_pve_tags(_pve_api, _nb_api, nb_objects)
     logger.info('Fetching VM metadata from Proxmox...')
-    pve_vm_tags: Dict[int, List[str]] = {}
-    pve_vm_pools: Dict[int, str] = {}
-    pve_template_vmids: set = set()
-    for pve_vm_resource in _pve_api.cluster.resources.get(type='vm'):
-        if pve_vm_resource['vmid'] in _changed_vmids:
-            _vmid = pve_vm_resource['vmid']
-            pve_vm_tags[_vmid] = []
-            if 'pool' in pve_vm_resource:
-                pve_vm_pools[_vmid] = pve_vm_resource['pool']
-                pve_vm_tags[_vmid].append(f'Pool/{pve_vm_resource["pool"]}')
-            if pve_vm_resource.get('template'):
-                pve_template_vmids.add(_vmid)
-                if _cfg().template_policy == 'tag':
-                    _ensure_nb_tag(TEMPLATE_TAG_NAME, _nb_api, nb_objects)
-                    pve_vm_tags[_vmid].append(TEMPLATE_TAG_NAME)
-            if _cfg().sync_tags and 'tags' in pve_vm_resource:
-                for _raw_tag in pve_vm_resource['tags'].split(';'):
-                    _tag_name = _raw_tag.strip()
-                    if _tag_name:
-                        _ensure_nb_tag(_tag_name, _nb_api, nb_objects)
-                        pve_vm_tags[_vmid].append(_tag_name)
+    pve_vm_tags, pve_vm_pools, pve_template_vmids = _collect_pve_guest_metadata(
+        _pve_api, _nb_api, nb_objects, decisions, set(_changed_vmids))
     skip_templates = _cfg().template_policy == 'skip'
-    
+
     pve_ha_virtual_machine_ids = list(
         map(
             lambda r: int(r['sid'].split(':')[1]),
             filter(lambda r: r['type'] == 'service', _pve_api.cluster.ha.status.current.get())
         )
     )
+    enabled_kinds = []
+    if _cfg().sync_vms:
+        enabled_kinds.append(QEMU)
+    if _cfg().sync_lxc:
+        enabled_kinds.append(LXC)
+
+    sync_errors = 0
     vms_by_node = {}
     nodes_info = {}
-    for pve_node in _pve_api.nodes.get():
+    for pve_node in pve_nodes:
         node_name = pve_node['node']
         nodes_info[node_name] = pve_node
-        vms_by_node[node_name] = {'qemu': [], 'lxc': []}
-        if _cfg().sync_vms:
-            for vm in _pve_api.nodes(node_name).qemu.get():
-                if vm['vmid'] in _changed_vmids:
-                    vms_by_node[node_name]['qemu'].append(vm)
-        if _cfg().sync_lxc:
-            for ct in _pve_api.nodes(node_name).lxc.get():
-                if ct['vmid'] in _changed_vmids:
-                    vms_by_node[node_name]['lxc'].append(ct)
-    sync_errors = 0
+        vms_by_node[node_name] = {QEMU: [], LXC: []}
+        for kind in enabled_kinds:
+            # QEMU and LXC are both the PVE endpoint name and the resource type.
+            for entry in getattr(_pve_api.nodes(node_name), kind).get():
+                if entry['vmid'] not in _changed_vmids:
+                    continue
+                if _skip_filtered_guest(decisions, entry, node_name, kind, pve_vm_pools):
+                    continue
+                if _preload_incomplete(nb_objects, int(entry['vmid'])):
+                    sync_errors += 1
+                    logger.error(
+                        f'    Skipping {entry.get("name", entry["vmid"])} '
+                        f'(ID: {entry["vmid"]}): its NetBox objects failed to load, and '
+                        f'syncing now would duplicate them'
+                    )
+                    continue
+                vms_by_node[node_name][kind].append(entry)
+
     for node_name, vms in vms_by_node.items():
-        if not vms['qemu'] and not vms['lxc']:
+        if not vms[QEMU] and not vms[LXC]:
             continue
         logger.info(f'  Processing node: {node_name}')
         pve_replicated_virtual_machine_ids = list(
@@ -1611,7 +2074,7 @@ def sync_specific_vms(
         if not _cfg().dry_run:
             nb_device.status = 'active' if pve_node['status'] == 'online' else 'offline'
             nb_device.save()
-        for vm in vms['qemu']:
+        for vm in vms[QEMU]:
             if shutdown.should_stop():
                 logger.warning('Quick sync interrupted by shutdown request')
                 return
@@ -1637,7 +2100,7 @@ def sync_specific_vms(
                     f'    Failed quick sync for VM {vm["name"]} (ID: {vm["vmid"]}): {e}',
                     exc_info=True,
                 )
-        for ct in vms['lxc']:
+        for ct in vms[LXC]:
             if shutdown.should_stop():
                 logger.warning('Quick sync interrupted by shutdown request')
                 return
@@ -1670,26 +2133,68 @@ def sync_specific_vms(
         logger.info('Quick sync completed successfully!')
 
 
-def cleanup_stale_vms(nb_api: pynetbox.api, nb_objects: dict, current_vmids: set, dry_run: bool = False) -> None:
+def _nb_vm_in_cluster(_nb_vm: Any, _cluster_id: Optional[int]) -> bool:
+    """
+    True when this NetBox VM belongs to the cluster this sync is responsible for.
+
+    A VM with no cluster counts as ours — it belongs to no other Proxmox
+    cluster, and skipping it would strand it forever. With no cluster
+    configured there is nothing to compare against, so everything is in scope.
+    """
+    if _cluster_id is None:
+        return True
+    vm_cluster_id = getattr(getattr(_nb_vm, 'cluster', None), 'id', None)
+    if vm_cluster_id is None:
+        return True
+    return int(vm_cluster_id) == int(_cluster_id)
+
+
+def cleanup_stale_vms(
+        nb_api: pynetbox.api,
+        nb_objects: dict,
+        current_vmids: set,
+        dry_run: bool = False,
+        protected_vmids: Optional[set] = None,
+) -> None:
     """
     Remove VMs from NetBox that no longer exist in Proxmox.
-    
-    Args:
-        nb_api: NetBox API instance
-        nb_objects: Dictionary of NetBox objects
-        current_vmids: Set of current VM IDs from Proxmox
-        dry_run: If True, only log what would be deleted
+
+    Two kinds of VM are deliberately out of reach:
+
+    - ``protected_vmids`` — filtered guests. They still exist in Proxmox, just
+      unsynced, so they never reach ``current_vmids``; deleting them would mean
+      that enabling ``EXCLUDE_TAGS`` wipes the records it was meant to spare.
+    - VMs of another NetBox cluster, which two Proxmox clusters syncing into one
+      NetBox would otherwise delete from each other. Checked here rather than
+      left to ``NB_PRELOAD_SCOPE`` narrowing the cache, so that
+      ``NB_PRELOAD_SCOPE=all`` cannot quietly bring the deletion back.
     """
     logger.info('Checking for stale VMs in NetBox...')
-    
+
+    cluster_id = _cfg().nb_cluster_id
+    protected_vmids = protected_vmids or set()
+    protected_seen = 0
+    foreign_seen = 0
     stale_vms = []
     for serial, nb_vm in nb_objects['virtual_machines'].items():
         try:
             vmid = int(serial)
-            if vmid not in current_vmids:
-                stale_vms.append((vmid, nb_vm))
         except (ValueError, TypeError):
             continue
+        if vmid in current_vmids:
+            continue
+        if vmid in protected_vmids:
+            protected_seen += 1
+            continue
+        if not _nb_vm_in_cluster(nb_vm, cluster_id):
+            foreign_seen += 1
+            continue
+        stale_vms.append((vmid, nb_vm))
+
+    if protected_seen:
+        logger.info(f'Cleanup skipped {protected_seen} filtered VM(s) still present in Proxmox')
+    if foreign_seen:
+        logger.info(f'Cleanup skipped {foreign_seen} VM(s) belonging to another NetBox cluster')
     
     if not stale_vms:
         logger.info('No stale VMs found.')
@@ -1754,7 +2259,12 @@ def main(
     sync_start_time = metrics.record_full_sync_start()
     _provision_custom_fields(nb_api)
     _provision_roles(nb_api)
-    nb_objects = _load_nb_objects(nb_api)
+
+    decisions = FilterDecisions(get_filters())
+    pve_nodes = _select_pve_nodes(pve_api, decisions)
+    node_names = [pve_node['node'] for pve_node in pve_nodes]
+
+    nb_objects = _load_nb_objects(nb_api, node_names)
     current_vmids = set()
     logger.info('Processing Proxmox tags...')
     _process_pve_tags(
@@ -1763,29 +2273,10 @@ def main(
         nb_objects,
     )
     logger.info('Fetching VM tags from Proxmox...')
-    pve_vm_tags: Dict[int, List[str]] = {}
-    pve_vm_pools: Dict[int, str] = {}
-    pve_template_vmids: set = set()
-    for pve_vm_resource in pve_api.cluster.resources.get(type='vm'):
-        _vmid = pve_vm_resource['vmid']
-        pve_vm_tags[_vmid] = []
-
-        if 'pool' in pve_vm_resource:
-            pve_vm_pools[_vmid] = pve_vm_resource['pool']
-            pve_vm_tags[_vmid].append(f'Pool/{pve_vm_resource["pool"]}')
-
-        if pve_vm_resource.get('template'):
-            pve_template_vmids.add(_vmid)
-            if config.template_policy == 'tag':
-                _ensure_nb_tag(TEMPLATE_TAG_NAME, nb_api, nb_objects)
-                pve_vm_tags[_vmid].append(TEMPLATE_TAG_NAME)
-
-        if config.sync_tags and 'tags' in pve_vm_resource:
-            for _raw_tag in pve_vm_resource['tags'].split(';'):
-                _tag_name = _raw_tag.strip()
-                if _tag_name:
-                    _ensure_nb_tag(_tag_name, nb_api, nb_objects)
-                    pve_vm_tags[_vmid].append(_tag_name)
+    pve_vm_tags, pve_vm_pools, pve_template_vmids = _collect_pve_guest_metadata(
+        pve_api, nb_api, nb_objects, decisions)
+    decisions.log_summary()
+    metrics.record_filtered(decisions.excluded_count)
 
     skip_templates = config.template_policy == 'skip'
     template_count = len(pve_template_vmids)
@@ -1806,7 +2297,7 @@ def main(
     
     sync_errors = 0
     interrupted = False
-    for pve_node in pve_api.nodes.get():
+    for pve_node in pve_nodes:
         if shutdown.should_stop():
             interrupted = True
             break
@@ -1835,6 +2326,20 @@ def main(
                 if shutdown.should_stop():
                     interrupted = True
                     break
+                if _skip_filtered_guest(
+                        decisions, pve_virtual_machine, pve_node['node'], QEMU, pve_vm_pools):
+                    continue
+                if _preload_incomplete(nb_objects, int(pve_virtual_machine['vmid'])):
+                    sync_errors += 1
+                    # Still present in Proxmox, so cleanup must not read the
+                    # skipped sync as "gone".
+                    current_vmids.add(pve_virtual_machine['vmid'])
+                    logger.error(
+                        f'    Skipping {pve_virtual_machine["name"]} '
+                        f'(ID: {pve_virtual_machine["vmid"]}): its NetBox objects '
+                        f'failed to load, and syncing now would duplicate them'
+                    )
+                    continue
                 if skip_templates and pve_virtual_machine['vmid'] in pve_template_vmids:
                     logger.debug(
                         f'    Skipping template VM: {pve_virtual_machine["name"]} '
@@ -1871,6 +2376,20 @@ def main(
                 if shutdown.should_stop():
                     interrupted = True
                     break
+                if _skip_filtered_guest(
+                        decisions, pve_container, pve_node['node'], LXC, pve_vm_pools):
+                    continue
+                if _preload_incomplete(nb_objects, int(pve_container['vmid'])):
+                    sync_errors += 1
+                    # Still present in Proxmox, so cleanup must not read the
+                    # skipped sync as "gone".
+                    current_vmids.add(pve_container['vmid'])
+                    logger.error(
+                        f'    Skipping {pve_container["name"]} (ID: {pve_container["vmid"]}): '
+                        f'its NetBox objects failed to load, and syncing now '
+                        f'would duplicate them'
+                    )
+                    continue
                 if skip_templates and pve_container['vmid'] in pve_template_vmids:
                     logger.debug(
                         f'    Skipping template LXC: {pve_container["name"]} '
@@ -1905,7 +2424,8 @@ def main(
         # visited would look stale and be deleted from NetBox.
         logger.warning('Sync interrupted by shutdown request; skipping cleanup')
     elif config.enable_cleanup:
-        cleanup_stale_vms(nb_api, nb_objects, current_vmids, config.dry_run)
+        cleanup_stale_vms(
+            nb_api, nb_objects, current_vmids, config.dry_run, decisions.excluded_vmids)
 
     succeeded = sync_errors == 0 and not interrupted
     metrics.record_full_sync_end(sync_start_time, vm_count, lxc_count, success=succeeded)

@@ -27,6 +27,8 @@ class SyncMetrics:
         last_success_timestamp: Timestamp of the last *successful* full sync
             (gauge). This is the one to alert on and the one /readyz uses.
         changes_detected: Number of changes detected in last quick check (gauge).
+        guests_filtered: Guests excluded by the selection filters in the last
+            full sync (gauge). A jump here explains a drop in vms_tracked.
     """
     full_syncs_total: int = 0
     quick_checks_total: int = 0
@@ -39,6 +41,7 @@ class SyncMetrics:
     last_sync_timestamp: float = 0.0
     last_success_timestamp: float = 0.0
     changes_detected: int = 0
+    guests_filtered: int = 0
 
     def record_full_sync_start(self) -> float:
         """Record start of full sync and return start time."""
@@ -66,6 +69,10 @@ class SyncMetrics:
         """Record quick check operation."""
         self.quick_checks_total += 1
         self.changes_detected = changes_count
+
+    def record_filtered(self, filtered_count: int) -> None:
+        """Record how many guests the selection filters excluded."""
+        self.guests_filtered = filtered_count
 
     def record_vm_sync(self) -> None:
         """Record VM sync."""
@@ -133,6 +140,10 @@ pve2netbox_last_success_timestamp_seconds {self.last_success_timestamp:.0f}
 # HELP pve2netbox_changes_detected Number of changes detected in last quick check
 # TYPE pve2netbox_changes_detected gauge
 pve2netbox_changes_detected {self.changes_detected}
+
+# HELP pve2netbox_guests_filtered Guests excluded by the selection filters in the last full sync
+# TYPE pve2netbox_guests_filtered gauge
+pve2netbox_guests_filtered {self.guests_filtered}
 """
 
 

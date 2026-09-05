@@ -105,8 +105,48 @@ Common optional variables:
 | `PLATFORM_MAP` | — | Override the built-in mapping: `l26=Linux,win11=Windows 11` |
 | `POOL_AS_TENANT` | `false` | Also map the Proxmox pool to a NetBox tenant (created if missing) |
 | `TEMPLATE_POLICY` | `tag` | Templates: `tag` (sync + tag `pve-template`), `skip`, `sync` |
+| `NB_PRELOAD_SCOPE` | `cluster` | How much of NetBox is read before a sync — see [Tuning NetBox load](#tuning-netbox-load) |
+
+Selecting what gets synced:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SYNC_NODES` | — | Only these Proxmox nodes are synced |
+| `EXCLUDE_NODES` | — | These nodes are skipped |
+| `SYNC_POOLS` | — | Only guests in these Proxmox pools |
+| `INCLUDE_TAGS` | — | Only guests carrying at least one of these PVE tags |
+| `EXCLUDE_TAGS` | — | Guests carrying any of these PVE tags are skipped |
+| `EXCLUDE_VMIDS` | — | Single IDs and ranges: `100,105,900-999` |
 
 Full list and comments: [.env.example](.env.example).
+
+---
+
+## Selecting what to sync
+
+Lists are comma- or space-separated and matched case-insensitively; PVE tags are matched whole
+(`db` does not match `dbserver`). A guest has to pass every configured filter, and the first rule
+that rejects it is what gets logged at `DEBUG`:
+
+```
+SYNC_NODES=pve1,pve2          # ignore the rest of the cluster
+EXCLUDE_TAGS=no-netbox        # opt individual guests out from the PVE UI
+EXCLUDE_VMIDS=900-999         # keep a scratch ID range out of the inventory
+```
+
+Every sync logs one summary line — `Filters excluded 12 of 340 guest(s) (EXCLUDE_TAGS: 8,
+EXCLUDE_VMIDS: 4)` — and the same number is exported as `pve2netbox_guests_filtered`.
+
+**Filtered guests are never deleted.** They still exist in Proxmox, so `ENABLE_CLEANUP=true`
+leaves their NetBox records untouched; only guests that are really gone are removed. The same now
+holds for `SYNC_VMS=false` / `SYNC_LXC=false`, which used to make cleanup delete every VM or
+container of the disabled type.
+
+Filters apply to the full sync, the quick check and cleanup alike. `SYNC_POOLS` is the one
+exception: pool membership is only visible through `/cluster/resources`. Where that endpoint is
+merely slow, a pool move is picked up by the full sync rather than by the quick check. Where the
+API token cannot read it at all, `SYNC_POOLS` cannot be honoured by anything and the sync stops
+with a configuration error instead of quietly matching no guest.
 
 ---
 
@@ -197,7 +237,8 @@ Metrics: `pve2netbox_build_info`, `pve2netbox_full_syncs_total`, `pve2netbox_qui
 `pve2netbox_vms_synced_total`, `pve2netbox_lxc_synced_total`, `pve2netbox_errors_total`,
 `pve2netbox_vms_tracked`, `pve2netbox_lxc_tracked`, `pve2netbox_last_sync_duration_seconds`,
 `pve2netbox_last_sync_timestamp_seconds` (last attempt), `pve2netbox_last_success_timestamp_seconds`
-(last success — alert on this one), `pve2netbox_changes_detected`.
+(last success — alert on this one), `pve2netbox_changes_detected`,
+`pve2netbox_guests_filtered` (guests excluded by the selection filters in the last full sync).
 
 ## Dry-run limitations
 
@@ -221,3 +262,32 @@ If NetBox returns 502s under load:
 - `NB_API_DELAY_SECONDS` — delay between requests (default `0.2`; try `0.5`–`1.0`).
 - `NB_API_RETRY_TOTAL` — retries on 502/503/429 (default `5`).
 - `NB_API_RETRY_BACKOFF` — backoff factor (default `1.0`).
+
+`NB_PRELOAD_SCOPE` controls how much of NetBox is read into memory before each sync:
+
+| Value | Behaviour |
+|-------|-----------|
+| `cluster` (default) | Virtual machines, their interfaces and their virtual disks are fetched with a `cluster_id` filter, and only devices named like a Proxmox node are read |
+| `all` | Every device, VM, interface and disk in NetBox — the behaviour before 1.2.0 |
+
+IP addresses, prefixes, MAC addresses, VLANs, tags and roles are always read globally: they are
+matched and de-conflicted across the whole of NetBox, and scoping them would change what the sync
+writes. Each sync logs what it loaded (`NetBox objects loaded: 3 devices, 210 VMs, …`).
+
+Use `all` only if VMs have to be adopted into this cluster from another one. It is a performance
+setting and nothing more: `ENABLE_CLEANUP` checks each VM's cluster before deleting it, so VMs
+belonging to another cluster are safe under either value.
+
+---
+
+## Development
+
+```bash
+pip install -e '.[dev]'
+pytest          # filter rules, config parsing, and the guards around NetBox reads
+pylint pve2netbox
+```
+
+The tests use no live Proxmox or NetBox. They pin the filter verdicts — the full sync, the quick
+check and cleanup have to agree about every guest — and the behaviour of a NetBox read that fails
+or answers something other than what was asked for.
