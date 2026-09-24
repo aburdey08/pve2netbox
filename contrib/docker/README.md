@@ -12,7 +12,7 @@ Quick change-check every minute + full sync every hour. Best balance for most se
 git clone https://github.com/aburdey08/pve2netbox.git
 cd pve2netbox
 
-# 1. Edit credentials in the compose file (PVE_API_*, NB_API_*):
+# 1. Edit credentials and the target cluster in the compose file (PVE_API_*, NB_API_*, NB_CLUSTER_ID):
 nano contrib/docker/docker-compose.combined-mode.yml
 
 # 2. Start:
@@ -42,7 +42,7 @@ Mode is selected by the interval variables in the compose file — see [main REA
 
 Everything is set in the `environment` block of the compose file you're running.
 
-**Required:** `PVE_API_HOST`, `PVE_API_USER`, `PVE_API_TOKEN`, `PVE_API_SECRET`, `NB_API_URL`, `NB_API_TOKEN`.
+**Required:** `PVE_API_HOST`, `PVE_API_USER`, `PVE_API_TOKEN`, `PVE_API_SECRET`, `NB_API_URL`, `NB_API_TOKEN`, and `NB_CLUSTER_ID` or `NB_CLUSTER_NAME`.
 
 Full variable reference: [main README — Configuration](../../README.md#configuration) and [.env.example](../../.env.example).
 
