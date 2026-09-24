@@ -1,6 +1,7 @@
 # pve2netbox
 
 [![Docker Hub](https://img.shields.io/badge/Docker%20Hub-0db7ed?logo=docker&logoColor=white)](https://hub.docker.com/r/aburdey/pve2netbox)
+[![tests](https://github.com/aburdey08/pve2netbox/actions/workflows/tests.yml/badge.svg)](https://github.com/aburdey08/pve2netbox/actions/workflows/tests.yml)
 
 Sync Proxmox VE (PVE) inventory to NetBox: QEMU VMs and LXC containers, their disks, network interfaces, IP addresses and tags.
 
@@ -105,8 +106,57 @@ Common optional variables:
 | `PLATFORM_MAP` | — | Override the built-in mapping: `l26=Linux,win11=Windows 11` |
 | `POOL_AS_TENANT` | `false` | Also map the Proxmox pool to a NetBox tenant (created if missing) |
 | `TEMPLATE_POLICY` | `tag` | Templates: `tag` (sync + tag `pve-template`), `skip`, `sync` |
+| `NB_PRELOAD_SCOPE` | `cluster` | How much of NetBox is read before a sync — see [Tuning NetBox load](#tuning-netbox-load) |
+
+Selecting what gets synced:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SYNC_NODES` | — | Only these Proxmox nodes are synced |
+| `EXCLUDE_NODES` | — | These nodes are skipped |
+| `SYNC_POOLS` | — | Only guests in these Proxmox pools |
+| `INCLUDE_TAGS` | — | Only guests carrying at least one of these PVE tags |
+| `EXCLUDE_TAGS` | — | Guests carrying any of these PVE tags are skipped |
+| `EXCLUDE_VMIDS` | — | Single IDs and ranges: `100,105,900-999` |
 
 Full list and comments: [.env.example](.env.example).
+
+---
+
+## Selecting what to sync
+
+Lists are comma- or space-separated and matched case-insensitively; PVE tags are matched whole
+(`db` does not match `dbserver`). A guest has to pass every configured filter, and the first rule
+that rejects it is what gets logged at `DEBUG`:
+
+```
+SYNC_NODES=pve1,pve2          # ignore the rest of the cluster
+EXCLUDE_TAGS=no-netbox        # opt individual guests out from the PVE UI
+EXCLUDE_VMIDS=900-999         # keep a scratch ID range out of the inventory
+```
+
+Every sync logs one summary line — `Filters excluded 12 of 340 guest(s) (EXCLUDE_TAGS: 8,
+EXCLUDE_VMIDS: 4)` — and the same number is exported as `pve2netbox_guests_filtered`.
+
+**Filtered guests are never deleted.** They still exist in Proxmox, so `ENABLE_CLEANUP=true`
+leaves their NetBox records untouched; only guests that are really gone are removed. The same now
+holds for `SYNC_VMS=false` / `SYNC_LXC=false`, which used to make cleanup delete every VM or
+container of the disabled type, and for the guests of a node skipped by
+`NODE_MISSING_POLICY=skip` — a node missing its NetBox device goes unsynced, but its guests are
+not deleted.
+
+Filters apply to the full sync, the quick check and cleanup alike. `SYNC_POOLS` is the one
+exception: pool membership needs `/cluster/resources`, the only endpoint that answers it in a
+single request. Where the API token cannot read it, the full sync rebuilds pool membership from
+`/pools` — a separate permission — and carries on; the quick check does not, so a pool move is
+then picked up by the next full sync rather than within the quick-check interval. Only when
+neither endpoint is readable does the sync stop with a configuration error instead of quietly
+matching no guest.
+
+Reading pools matters beyond `SYNC_POOLS`: tags are written to NetBox wholesale, so a pass that
+cannot see pools would strip the `Pool/*` tag off every guest it touches. If that ever happens
+you get a warning naming the consequence, and the tag comes back on the next pass that can read
+pools.
 
 ---
 
@@ -197,7 +247,8 @@ Metrics: `pve2netbox_build_info`, `pve2netbox_full_syncs_total`, `pve2netbox_qui
 `pve2netbox_vms_synced_total`, `pve2netbox_lxc_synced_total`, `pve2netbox_errors_total`,
 `pve2netbox_vms_tracked`, `pve2netbox_lxc_tracked`, `pve2netbox_last_sync_duration_seconds`,
 `pve2netbox_last_sync_timestamp_seconds` (last attempt), `pve2netbox_last_success_timestamp_seconds`
-(last success — alert on this one), `pve2netbox_changes_detected`.
+(last success — alert on this one), `pve2netbox_changes_detected`,
+`pve2netbox_guests_filtered` (guests excluded by the selection filters in the last full sync).
 
 ## Dry-run limitations
 
@@ -221,3 +272,58 @@ If NetBox returns 502s under load:
 - `NB_API_DELAY_SECONDS` — delay between requests (default `0.2`; try `0.5`–`1.0`).
 - `NB_API_RETRY_TOTAL` — retries on 502/503/429 (default `5`).
 - `NB_API_RETRY_BACKOFF` — backoff factor (default `1.0`).
+
+`NB_PRELOAD_SCOPE` controls how much of NetBox is read into memory before each sync:
+
+| Value | Behaviour |
+|-------|-----------|
+| `cluster` (default) | Virtual machines, their interfaces and their virtual disks are fetched with a `cluster_id` filter, and only devices named like a Proxmox node are read |
+| `all` | Every device, VM, interface and disk in NetBox — the behaviour before 1.2.0 |
+
+IP addresses, prefixes, MAC addresses, VLANs, tags and roles are always read globally: they are
+matched and de-conflicted across the whole of NetBox, and scoping them would change what the sync
+writes. Each sync logs what it loaded (`NetBox objects loaded: 3 devices, 210 VMs, …`).
+
+Use `all` only if VMs have to be adopted into this cluster from another one. It is a performance
+setting and nothing more: `ENABLE_CLEANUP` checks each VM's cluster before deleting it, so VMs
+belonging to another cluster are safe under either value.
+
+How much it saves depends on how much of NetBox belongs to other clusters — the global IPAM read
+is the floor both values pay. Measured with `tools/preload_bench.py` on a NetBox of 10 clusters,
+one of them synced:
+
+| Inventory | Scope | Requests | Records | Read | Time | Peak memory |
+|-----------|-------|---------:|--------:|-----:|-----:|------------:|
+| 3 000 VMs, 20 000 IPs | `cluster` | 35 | 29 810 | 16.3 MiB | 13.0 s | 114 MiB |
+| | `all` | 47 | 43 800 | 24.8 MiB | 20.4 s | 190 MiB |
+| 5 000 VMs, 50 000 IPs | `cluster` | 76 | 71 812 | 39.1 MiB | 34.1 s | 272 MiB |
+| | `all` | 98 | 95 100 | 53.4 MiB | 45.3 s | 398 MiB |
+
+Below that scale there is nothing to save: on a real NetBox of 36 VMs and 70 IP addresses both
+values read the same 314 records, and `cluster` spent two requests more widening a device query.
+It never costs more than that.
+
+Measure your own installation:
+
+```bash
+python tools/preload_bench.py                    # a generated inventory, no NetBox needed
+python tools/preload_bench.py --mode live        # the NetBox from your .env, read-only
+```
+
+---
+
+## Development
+
+```bash
+pip install -e '.[dev]'
+pytest          # filter rules, config parsing, and the guards around NetBox reads
+pylint pve2netbox
+```
+
+The tests use no live Proxmox or NetBox. They pin the filter verdicts — the full sync, the quick
+check and cleanup have to agree about every guest — the behaviour of a NetBox read that fails or
+answers something other than what was asked for, and the promise that `NB_PRELOAD_SCOPE` changes
+only how much is read, never what the sync is given.
+
+`tools/preload_bench.py` measures that preload; it is a development tool and not part of the
+installed package.

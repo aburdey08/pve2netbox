@@ -4,7 +4,7 @@
 
 services:
   pve2netbox:
-    image: aburdey/pve2netbox:1.1.0
+    image: aburdey/pve2netbox:1.2.0
     environment:
       # PVE API (required — replace with your values)
       - PVE_API_HOST=10.10.0.10
@@ -14,9 +14,10 @@ services:
       # NetBox API (required — replace with your values)
       - NB_API_URL=https://netbox.example.org
       - NB_API_TOKEN=your-netbox-token-here
+      # Target cluster (required): an existing ID, or NB_CLUSTER_NAME=... (created if missing)
+      - NB_CLUSTER_ID=1
       # Optional
       - PVE_API_VERIFY_SSL=false
-      - NB_CLUSTER_ID=1
       - NB_API_DELAY_SECONDS=0.2
       - NB_API_RETRY_TOTAL=5
       - NB_API_RETRY_BACKOFF=1.0
@@ -33,6 +34,16 @@ services:
       - POOL_AS_TENANT=false
       # Templates: tag (mark with "pve-template") | skip | sync
       - TEMPLATE_POLICY=tag
+      # Selecting what to sync (optional). Comma- or space-separated, case-insensitive.
+      # Filtered guests are never deleted by ENABLE_CLEANUP — they still exist in Proxmox.
+      # - SYNC_NODES=pve1,pve2
+      # - EXCLUDE_NODES=pve-test
+      # - SYNC_POOLS=prod,dmz
+      # - INCLUDE_TAGS=netbox
+      # - EXCLUDE_TAGS=no-netbox
+      # - EXCLUDE_VMIDS=100,105,900-999
+      # How much of NetBox is read before each sync: cluster (default) or all (pre-1.2.0 behaviour)
+      - NB_PRELOAD_SCOPE=cluster
       - VM_ROLE=Virtual Machine
       - LXC_ROLE=LXC
       # Single-run mode: do not set SYNC_INTERVAL_SECONDS and QUICK_CHECK_INTERVAL_SECONDS

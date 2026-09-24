@@ -1,5 +1,73 @@
 # pve2netbox
 
+## [1.2.0] - 2026-09-04
+
+Configurable guest selection, a quick check that costs one Proxmox request instead of two per
+node, and a full sync that no longer reads all of NetBox into memory.
+
+### Added
+
+- **Selection filters** — comma- or space-separated, case-insensitive; a guest must pass all of
+  them, and filtered guests are never deleted by `ENABLE_CLEANUP`.
+
+  | Variable | Meaning |
+  |----------|---------|
+  | `SYNC_NODES` / `EXCLUDE_NODES` | Only these Proxmox nodes / skip these nodes |
+  | `SYNC_POOLS` | Only guests in these Proxmox pools |
+  | `INCLUDE_TAGS` / `EXCLUDE_TAGS` | Only guests with these PVE tags / skip guests with them |
+  | `EXCLUDE_VMIDS` | Single IDs and ranges: `100,105,900-999` |
+
+  Each sync logs `Filters excluded 12 of 340 guest(s) (EXCLUDE_TAGS: 8, EXCLUDE_VMIDS: 4)` and
+  exports the count as `pve2netbox_guests_filtered`.
+- **`NB_PRELOAD_SCOPE`** (`cluster` | `all`, default `cluster`) — how much of NetBox is read
+  before a sync; see [Tuning NetBox load](README.md#tuning-netbox-load).
+- **Test suite** — 141 pytest cases needing no live Proxmox or NetBox
+  (`pip install -e '.[dev]' && pytest`), run on Python 3.9–3.13 in GitHub Actions.
+
+### Changed
+
+- **Quick check uses `/cluster/resources`:** 1 request per cycle instead of 2 per node, and a
+  retag or pool move is detected within one interval instead of at the next full sync. The
+  per-node path stays as a fallback, chosen once at startup.
+- **`NB_PRELOAD_SCOPE=cluster` (default)** fetches VMs, interfaces and disks by `cluster_id` and
+  only the devices named like a Proxmox node; IPs, prefixes, MACs, VLANs, tags and roles stay
+  global. On a NetBox of 10 clusters and 3 000 VMs that is 30 000 records instead of 44 000: 36%
+  less time, 40% less peak memory. `all` restores 1.1.0 behaviour, needed only to adopt a VM from
+  another cluster.
+- A downed node's guests report status `unknown`, which no longer counts as a change.
+
+### Fixed
+
+Five of these could destroy data:
+
+- **`ENABLE_CLEANUP=true` deleted VMs of other NetBox clusters** — two Proxmox clusters syncing
+  into one NetBox removed each other's records; cleanup now checks each VM's cluster.
+- **`ENABLE_CLEANUP=true` with `SYNC_LXC=false` (or `SYNC_VMS=false`) deleted every container (or
+  VM)** — a disabled type was read as "gone from Proxmox".
+- **`ENABLE_CLEANUP=true` deleted the guests of a node with no matching NetBox device** — the node
+  is skipped (`NODE_MISSING_POLICY=skip`) and its guests were then read as gone from Proxmox. They
+  are now left alone; the node still goes unsynced with an error in the log.
+- **A failed NetBox read duplicated interfaces and disks** — loads are now chunked per VM, and a
+  guest whose cache could not be filled is skipped with an error instead of synced against an
+  empty cache.
+- **A device query NetBox honoured only in part emptied guests out of NetBox** — a silently
+  narrowed answer left nodes looking deviceless, and their guests were deleted. Answers are now
+  checked against the names asked for and widened if they fall short.
+- **The per-node fallback stripped every `Pool/*` tag** — pool membership is rebuilt from
+  `/pools`, and the residual case (neither endpoint readable) warns instead of doing it silently.
+- A query widens its filter only on HTTP 400; a timeout or 502 is raised instead of escalating
+  into a read of the whole inventory.
+- Batched `serial=` lookups are verified — some NetBox versions narrow such a query to its last
+  value, returning one VM out of fifty.
+- A pool with an empty ID no longer produces a meaningless `Pool/` tag.
+
+### Upgrade notes
+
+- No action needed; set `NB_PRELOAD_SCOPE=all` only if you relied on adopting VMs from other
+  clusters. `SYNC_POOLS` now needs a token that can read `/cluster/resources` or `/pools`.
+- The first quick check reports every guest as changed (tracked state gained `pool` and `tags`)
+  and settles after one cycle.
+
 ## [1.1.0] - 2026-08-22
 
 Feature release: LXC containers finally get their IP addresses into NetBox, and VM records carry

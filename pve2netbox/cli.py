@@ -25,8 +25,13 @@ import urllib3
 from . import main as run_sync
 from . import shutdown, sync_specific_vms
 from .api.netbox import make_netbox_session, resolve_cluster
-from .api.proxmox import create_proxmox_api, quick_check_changes
+from .api.proxmox import (
+    create_proxmox_api,
+    detect_quick_check_source,
+    quick_check_changes,
+)
 from .config import Config, describe_config, load_config, load_env_file, set_config
+from .filters import get_filters
 from .logger import log_section, log_subsection, logger, set_log_level
 from .metrics import default_readiness, metrics, start_http_server
 from .version import get_version
@@ -171,9 +176,15 @@ def _run_combined(config: Config, pve_api, nb_api) -> int:
     quick_check_interval = config.quick_check_interval_seconds
     full_sync_interval = config.sync_interval_seconds or DEFAULT_FULL_SYNC_INTERVAL_SECONDS
 
+    # Decided once: probing /cluster/resources on every cycle would hide a
+    # permission problem behind a silent fallback (see 1.0.8).
+    quick_check_source = detect_quick_check_source(pve_api)
+    guest_filters = get_filters()
+
     log_section('Running in combined mode')
     logger.info(f'  - Quick check every {quick_check_interval}s')
     logger.info(f'  - Full sync every {full_sync_interval}s')
+    logger.info(f'  - Quick check source: {quick_check_source}')
 
     log_section('Initial full sync')
     last_full_sync = time.time() if _run_full_sync(
@@ -187,7 +198,8 @@ def _run_combined(config: Config, pve_api, nb_api) -> int:
     if not shutdown.should_stop():
         log_subsection('Initializing quick check state')
         try:
-            _, last_quick_state = quick_check_changes(pve_api, {}, config)
+            _, last_quick_state = quick_check_changes(
+                pve_api, {}, config, quick_check_source, guest_filters)
             logger.info(f'Tracking {len(last_quick_state)} VMs for changes')
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f'Failed to initialize quick check state: {e}', exc_info=True)
@@ -203,7 +215,8 @@ def _run_combined(config: Config, pve_api, nb_api) -> int:
             if shutdown.should_stop():
                 break
             try:
-                _, last_quick_state = quick_check_changes(pve_api, {}, config)
+                _, last_quick_state = quick_check_changes(
+                    pve_api, {}, config, quick_check_source, guest_filters)
                 logger.info(f'Full sync completed. Tracking {len(last_quick_state)} VMs.')
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to refresh quick check state: {e}', exc_info=True)
@@ -215,7 +228,7 @@ def _run_combined(config: Config, pve_api, nb_api) -> int:
         )
         try:
             changed_vmids, last_quick_state = quick_check_changes(
-                pve_api, last_quick_state, config)
+                pve_api, last_quick_state, config, quick_check_source, guest_filters)
             metrics.record_quick_check(len(changed_vmids))
 
             if changed_vmids:
